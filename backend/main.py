@@ -139,8 +139,28 @@ def _build_filename(creator: str, date: str) -> str:
     return f"{date}-{_slugify(creator)}.md"
 
 
-def extract_creator_from_metadata(instagram_link: str, work_dir: str) -> str:
-    """Extract creator/uploader name from Instagram video via yt-dlp metadata."""
+def extract_creator_from_url(instagram_link: str) -> str:
+    """Extract creator handle from Instagram URL. Falls back to 'Unknown Creator' if not found."""
+    log.info(f"[0/6] extract creator from URL: {instagram_link}")
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(instagram_link)
+        path_parts = parsed.path.strip("/").split("/")
+        if path_parts and path_parts[0] and not path_parts[0] in ("reel", "p", "tv", "stories"):
+            creator = path_parts[0].replace(".", " ").title()
+            log.info(f"[0/6] extracted creator from URL: {creator}")
+            return creator
+    except Exception as e:
+        log.warning(f"[0/6] failed to parse URL: {e}")
+    log.warning("[0/6] couldn't extract creator from URL, using 'Unknown Creator'")
+    return "Unknown Creator"
+
+
+def extract_creator_from_metadata(instagram_link: str) -> str:
+    """
+    Extract creator/uploader name from Instagram video via yt-dlp metadata.
+    Falls back to URL parsing if metadata extraction fails (e.g., rate-limited).
+    """
     log.info(f"[0/6] extract creator metadata: {instagram_link}")
     cmd = [
         "yt-dlp",
@@ -150,25 +170,16 @@ def extract_creator_from_metadata(instagram_link: str, work_dir: str) -> str:
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    except subprocess.TimeoutExpired as e:
-        log.warning(f"[0/6] metadata extraction timeout, falling back to 'Unknown Creator'")
-        return "Unknown Creator"
-    except FileNotFoundError as e:
-        log.warning(f"[0/6] yt-dlp not found, falling back to 'Unknown Creator'")
-        return "Unknown Creator"
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            uploader = data.get("uploader") or data.get("channel") or data.get("artist")
+            if uploader:
+                log.info(f"[0/6] extracted creator from metadata: {uploader}")
+                return uploader.strip()
+    except Exception as e:
+        log.debug(f"[0/6] metadata extraction failed ({type(e).__name__}), trying URL parsing")
 
-    if result.returncode != 0:
-        log.warning(f"[0/6] yt-dlp metadata failed: {result.stderr[:200]}, falling back")
-        return "Unknown Creator"
-
-    try:
-        data = json.loads(result.stdout)
-        uploader = data.get("uploader") or data.get("channel") or data.get("artist") or "Unknown Creator"
-        log.info(f"[0/6] extracted creator: {uploader}")
-        return uploader.strip()
-    except (json.JSONDecodeError, KeyError) as e:
-        log.warning(f"[0/6] failed to parse metadata: {e}, falling back")
-        return "Unknown Creator"
+    return extract_creator_from_url(instagram_link)
 
 
 def auto_categorize_transcript(transcript: str) -> str:
