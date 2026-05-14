@@ -113,3 +113,13 @@ client/public/__manus__/version.json
 
 backend/.env
 backend/__pycache__/
+**/__pycache__/
+*.pyc
+
+# Python virtualenvs
+.venv/
+venv/
+
+# Manus / Forge project config (contains live credentials — never commit)
+.project-config.json
+.manus-logs/

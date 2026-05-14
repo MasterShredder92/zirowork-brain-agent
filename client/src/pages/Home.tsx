@@ -39,7 +39,8 @@ const INITIAL_STEPS: PipelineStep[] = [
 ];
 
 // ── Backend URL ───────────────────────────────────────────────────────────────
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:8000";
+// Same-origin in prod (FastAPI serves the SPA). In dev, vite proxies /api → :8000.
+const BACKEND_URL = "";
 
 // ── Step Icon ─────────────────────────────────────────────────────────────────
 function StepIcon({ status }: { status: StepStatus }) {
@@ -236,7 +237,7 @@ export default function Home() {
         <div className="zw-callout-purple" style={{ margin: 0, borderLeft: "none", borderBottom: "1px solid rgba(139,92,246,0.3)" }}>
           <div className="zw-wrap" style={{ padding: "10px 20px" }}>
             <span style={{ fontSize: 12, fontWeight: 600, letterSpacing: 1 }}>
-              Backend not detected at {BACKEND_URL} — start it with: <code style={{ color: "var(--purple-glow)", background: "rgba(139,92,246,0.1)", padding: "2px 6px" }}>cd backend && python main.py</code>
+              Backend not reachable at /api — in dev, start it with: <code style={{ color: "var(--purple-glow)", background: "rgba(139,92,246,0.1)", padding: "2px 6px" }}>cd backend && python main.py</code>
             </span>
           </div>
         </div>

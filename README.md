@@ -2,129 +2,140 @@
 
 **Video Intelligence Processor** — converts Instagram links into structured markdown knowledge files saved to Google Drive for Obsidian sync.
 
-**Pipeline:** Instagram Link → Audio Extract (yt-dlp) → Transcribe (Whisper) → Process (Claude) → Markdown → Google Drive → Cleanup
+**Pipeline:** Instagram link → audio (yt-dlp) → transcript (Whisper) → markdown (Claude) → Google Drive → cleanup.
 
 ---
 
-## Stack
+## Architecture
 
-| Layer | Tech |
-|---|---|
-| Frontend | React 19 + TypeScript + Tailwind 4 |
-| Backend | Python 3.11 + FastAPI + Uvicorn |
-| Audio Extract | yt-dlp |
-| Transcription | OpenAI Whisper API (`whisper-1`) |
-| AI Processing | Anthropic Claude (`claude-opus-4-20250514`) |
-| Storage | Google Drive API v3 (service account) |
-| Design | ZiroWork design system (Bebas Neue + DM Sans, lime/black) |
-
----
-
-## Project Structure
+Single Railway service. FastAPI serves both the API and the built React SPA from one process at one URL.
 
 ```
-zirowork-brain-agent/
+Railway service
+├─ /                   → React SPA (Vite build, dist/public/)
+├─ /assets/*           → static
+├─ /api/health         → FastAPI
+├─ /api/config         → FastAPI
+└─ /api/process-video  → FastAPI (the pipeline)
+```
+
+| Layer        | Tech                                                |
+|--------------|-----------------------------------------------------|
+| Frontend     | React 19 + TypeScript + Tailwind 4 (Vite)           |
+| Backend      | Python 3.11 + FastAPI + Uvicorn                     |
+| Audio        | yt-dlp + ffmpeg                                     |
+| Transcribe   | OpenAI Whisper (`whisper-1`)                        |
+| Process      | Anthropic Claude (`claude-opus-4-20250514`)         |
+| Storage      | Google Drive API v3 (service account)               |
+| Deploy       | Railway via Nixpacks (single service)               |
+
+---
+
+## Repo layout
+
+```
+.
 ├── backend/
-│   ├── main.py          ← FastAPI app, full 6-step pipeline
-│   └── env-example.txt  ← Environment variable reference
+│   ├── main.py            ← FastAPI app + pipeline + SPA fallback
+│   └── requirements.txt
 ├── client/
-│   ├── src/
-│   │   ├── pages/Home.tsx     ← Main UI
-│   │   ├── index.css          ← ZiroWork design system
-│   │   └── App.tsx
-│   └── index.html
-└── README.md
+│   ├── src/pages/Home.tsx ← single-page UI
+│   └── ...
+├── shared/                ← types shared between client & server
+├── nixpacks.toml          ← Railway build (Node + Python + ffmpeg)
+├── railway.json           ← Railway runtime config + healthcheck
+├── Procfile               ← fallback start command
+├── package.json           ← Vite build scripts
+├── vite.config.ts         ← /api dev proxy → :8000
+└── .env.example           ← env var schema
 ```
 
 ---
 
-## Setup
+## Deploy to Railway
 
-### 1. Backend
+1. Push the repo to GitHub.
+2. In Railway, **New Project → Deploy from GitHub** and select the repo.
+3. Add these **Variables**:
+   - `OPENAI_API_KEY`
+   - `ANTHROPIC_API_KEY`
+   - `GOOGLE_DRIVE_FOLDER_ID`
+   - `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON` (the full JSON, minified)
+   - (optional) `APPROVED_CREATORS`, `CONTENT_CATEGORIES`, `CLAUDE_MODEL`, `LOG_LEVEL`
+4. Railway will detect `nixpacks.toml`, install Node + Python + ffmpeg, build the SPA, install Python deps into `/opt/venv`, and start `python backend/main.py`.
+5. The healthcheck at `/api/health` must return 200 within 30s for the deploy to be marked healthy.
+
+**Why this works (and the previous build didn't):**
+
+- All deploy config is at the repo root where Railway looks. Previously `nixpacks.toml`, `Procfile`, `runtime.txt` and `railway.json` were under `backend/`, where Nixpacks ignores them.
+- The root `package.json` no longer pretends to be a deployable Node app; build is just `vite build`.
+- `backend/main.py` no longer crashes at import on missing API keys — it logs warnings and returns `MISSING_CONFIG` from the API instead, so the container stays up and you can see logs.
+- FastAPI serves the SPA, so there's no second service, no CORS, no two URLs.
+
+---
+
+## Local development
+
+Two terminals:
 
 ```bash
+# 1. Backend (port 8000)
 cd backend
-
-# Install dependencies (already done if using this repo)
-pip install fastapi uvicorn yt-dlp openai anthropic google-api-python-client google-auth python-dotenv
-
-# Create .env from example
-cp env-example.txt .env
-# Fill in your API keys (see Environment Variables below)
-
-# Start backend
+python -m venv .venv && source .venv/bin/activate   # or .venv\Scripts\activate on Windows
+pip install -r requirements.txt
+cp ../.env.example ../.env       # then fill in real keys
 python main.py
-# → Running at http://localhost:8000
 ```
 
-### 2. Frontend
-
 ```bash
-# From project root
+# 2. Frontend (port 3000, proxies /api → :8000)
 pnpm install
 pnpm dev
-# → Running at http://localhost:3000
 ```
 
-The frontend auto-connects to `http://localhost:8000`. Override with `VITE_BACKEND_URL` env var.
+Open <http://localhost:3000>. The Vite dev server proxies `/api/*` to FastAPI, so it behaves the same as production.
 
----
-
-## Environment Variables
-
-Create `backend/.env` with these values:
+To preview the production build locally:
 
 ```bash
-# OpenAI (Whisper)
-OPENAI_API_KEY=sk-...
-
-# Anthropic (Claude)
-ANTHROPIC_API_KEY=sk-ant-...
-
-# Google Drive — folder ID from URL: drive.google.com/drive/folders/<ID>
-GOOGLE_DRIVE_FOLDER_ID=your_folder_id
-
-# Service account JSON (single line, or use a file path)
-GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"..."}
-
-# Optional
-APPROVED_CREATORS=Andrew Huberman,Simon Willison,Andrej Karpathy
-CONTENT_CATEGORIES=Agent Design,LLM Optimization,Product Strategy,AI Safety & Ethics,Technical Architecture,Business & Growth
-LOG_LEVEL=info
-TEMP_DIR=/tmp
-BACKEND_PORT=8000
+pnpm build
+cd backend && python main.py    # FastAPI now serves dist/public + /api on :8000
 ```
 
 ---
 
-## Google Drive Setup
+## Environment variables
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com)
-2. Create a project → Enable **Google Drive API**
-3. Create a **Service Account** → Download JSON key
-4. Share your target Drive folder with the service account email (Editor access)
-5. Copy the folder ID from the URL and set `GOOGLE_DRIVE_FOLDER_ID`
-6. Paste the entire service account JSON (minified) into `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON`
+See [.env.example](.env.example) for the full schema. Required: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`. Optional but recommended: the two `GOOGLE_DRIVE_*` vars (without them, the markdown is generated and returned but not saved).
+
+`PORT` is set automatically by Railway. `CORS_ALLOW_ORIGINS` defaults to `*` and isn't strictly needed for the single-service setup.
 
 ---
 
-## API Reference
+## API
 
 ### `GET /api/health`
 ```json
-{ "status": "ok", "service": "ZiroWork Brain Agent" }
+{
+  "status": "ok",
+  "service": "ZiroWork Brain Agent",
+  "version": "2.0.0",
+  "spa_built": true,
+  "drive_configured": true,
+  "openai_configured": true,
+  "anthropic_configured": true
+}
 ```
 
 ### `GET /api/config`
 ```json
 {
-  "approved_creators": ["Andrew Huberman", ...],
-  "content_categories": ["Agent Design", ...]
+  "approved_creators": ["Andrew Huberman", "..."],
+  "content_categories": ["Agent Design", "..."]
 }
 ```
 
 ### `POST /api/process-video`
-
 **Request:**
 ```json
 {
@@ -133,70 +144,58 @@ BACKEND_PORT=8000
   "category": "Agent Design"
 }
 ```
-
-**Success Response:**
+**Success:**
 ```json
 {
   "status": "success",
-  "filename": "2025-05-14-andrew-huberman.md",
+  "filename": "2026-05-14-andrew-huberman.md",
   "drive_url": "https://drive.google.com/file/d/.../view",
-  "preview": "# Title\n\n**Core Insight:**...",
-  "message": "Saved to ZiroWork-Brain/Raw Videos/"
+  "preview": "---\ndate: 2026-05-14\n...",
+  "message": "Saved to Google Drive: 2026-05-14-andrew-huberman.md"
 }
 ```
-
-**Error Response:**
+**Error:**
 ```json
-{
-  "status": "error",
-  "error": "Invalid Instagram link. Check URL and try again.",
-  "code": "INVALID_LINK"
-}
+{ "status": "error", "error": "...", "code": "INVALID_LINK" }
 ```
 
-**Error Codes:**
+| Code                    | Meaning                                                  |
+|-------------------------|----------------------------------------------------------|
+| `MISSING_CONFIG`        | `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` not set on server |
+| `INVALID_LINK`          | Not a recognised Instagram URL                            |
+| `INVALID_CREATOR`       | Creator not in `APPROVED_CREATORS`                        |
+| `INVALID_CATEGORY`      | Category not in `CONTENT_CATEGORIES`                      |
+| `EXTRACTION_FAILED`     | yt-dlp failed (bad link, geo-block, login required)       |
+| `TRANSCRIPTION_FAILED`  | Whisper API error or audio > 25 MB                        |
 
-| Code | Meaning |
-|---|---|
-| `INVALID_LINK` | yt-dlp can't extract — bad URL |
-| `INVALID_CREATOR` | Creator not in approved list |
-| `INVALID_CATEGORY` | Category not valid |
-| `MISSING_CONFIG` | API key not set in .env |
-| `TRANSCRIPTION_FAILED` | Whisper API error |
-| `PROCESSING_FAILED` | Claude API error (raw transcript saved) |
-| `DRIVE_WRITE_FAILED` | Google Drive API error |
-| `TIMEOUT` | Network timeout |
+(Claude failures are non-fatal: the raw transcript is saved with a fallback header.)
 
 ---
 
-## Output Markdown Format
+## Output markdown format
 
 ```markdown
 ---
-date: 2025-05-14
+date: 2026-05-14
 creator: Andrew Huberman
 category: Agent Design
 source_url: https://instagram.com/reel/...
-duration: unknown
 processed_by: Claude (claude-opus-4-20250514)
 ---
 
-**Source:** [Andrew Huberman](link) | **Date:** 2025-05-14
+**Source:** [Andrew Huberman](link) | **Date:** 2026-05-14
 
 # [Clear, Specific Title]
 
 **Core Insight:** [1-2 sentence summary]
 
 ## Key Points
-
 ### 1. [Topic] [MM:SS-MM:SS]
 [Explanation]
-- Bullet
-**Why it matters:** [Connection to AI/product building]
+**Why it matters:** [Connection]
 
 ## Actionable Takeaways
 - [ ] Action 1
-- [ ] Action 2
 
 ## Related Concepts
 - [[Concept 1]]
@@ -204,52 +203,28 @@ processed_by: Claude (claude-opus-4-20250514)
 
 ---
 
-## Cost Estimate
+## Cost (rough)
 
-| Service | Per Video | Per Month (50 videos) |
-|---|---|---|
-| OpenAI Whisper | $0.02–0.05 | $1–2.50 |
-| Anthropic Claude | $0.08–0.12 | $4–6 |
-| Google Drive | Free | Free |
-| **Total** | **~$0.10–0.17** | **~$5–8.50** |
-
----
-
-## Testing Checklist
-
-- [ ] Test with real Instagram Reel (5–30 min)
-- [ ] Verify Whisper transcription includes timestamps
-- [ ] Verify Claude removes sales pitch from raw transcript
-- [ ] Verify markdown saves to correct Google Drive folder
-- [ ] Verify filename: `YYYY-MM-DD-creator-name.md`
-- [ ] Test error: invalid link (graceful error, no crash)
-- [ ] Test error: network timeout (retry, then fail cleanly)
-- [ ] Verify temp audio files deleted after processing
-- [ ] Performance: link input → Drive save < 5 min for 30-min video
+| Service       | Per video    | Per month (50 videos) |
+|---------------|--------------|------------------------|
+| Whisper       | $0.02–0.05   | $1–2.50                |
+| Claude        | $0.08–0.12   | $4–6                   |
+| Drive         | free         | free                   |
+| **Total**     | **~$0.10–0.17** | **~$5–8.50**         |
 
 ---
 
-## Adding Creators / Categories
+## Adding creators / categories
 
-Edit `backend/.env`:
+Set the env vars in Railway and redeploy (or restart the service):
 
-```bash
+```
 APPROVED_CREATORS=Andrew Huberman,Simon Willison,Andrej Karpathy,Lex Fridman
 CONTENT_CATEGORIES=Agent Design,LLM Optimization,Product Strategy,New Category
 ```
 
-Restart backend. Frontend picks up changes automatically via `/api/config`.
+The frontend re-fetches `/api/config` on load and picks up the new values automatically.
 
 ---
 
-## Post-MVP Roadmap
-
-- Creator approval workflow (add/remove via UI)
-- Agent interface to query ZiroWork-Brain folder
-- Weekly digest feature
-- Search + filtering
-- Auto-categorization (Claude assigns categories)
-
----
-
-*ZiroWork Brain Agent — Built for Zach Adkins / ZiroWork Intelligence System*
+*ZiroWork Brain Agent v2.0 — built for Zach Adkins / ZiroWork Intelligence System*

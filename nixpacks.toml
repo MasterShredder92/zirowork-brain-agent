@@ -1,0 +1,27 @@
+# ─────────────────────────────────────────────────────────────────────
+# ZiroWork Brain Agent — Nixpacks build for Railway
+#
+# Single service that builds the Vite SPA and runs the FastAPI backend.
+# FastAPI serves both /api/* and the built SPA from dist/public/.
+# ─────────────────────────────────────────────────────────────────────
+
+[phases.setup]
+nixPkgs    = ["python311", "nodejs_20", "pnpm"]
+aptPkgs    = ["ffmpeg"]
+
+[phases.install]
+cmds = [
+  "pnpm install --frozen-lockfile",
+  "python -m venv /opt/venv",
+  ". /opt/venv/bin/activate && pip install --no-cache-dir -r backend/requirements.txt",
+]
+
+[phases.build]
+cmds = ["pnpm run build"]
+
+[start]
+cmd = ". /opt/venv/bin/activate && python backend/main.py"
+
+[variables]
+PYTHONUNBUFFERED = "1"
+PIP_DISABLE_PIP_VERSION_CHECK = "1"
