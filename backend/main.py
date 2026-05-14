@@ -15,10 +15,10 @@ import re
 import shutil
 import subprocess
 import tempfile
-import requests
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from apify_client import ApifyClient
 
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
@@ -46,7 +46,8 @@ GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
 GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
-SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "")
+APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN", "")
+APIFY_ACTOR_ID = "shu8hvrXbJbY3Eb9W"  # Instagram video downloader actor
 
 APPROVED_CREATORS = [
     c.strip()
@@ -222,82 +223,72 @@ def auto_categorize_transcript(transcript: str) -> str:
 # ── Step 1: extract audio ────────────────────────────────────────────────────
 def extract_audio(instagram_link: str, work_dir: str) -> str:
     """
-    Download audio from Instagram via ScraperAPI (avoids rate limiting).
+    Download audio from Instagram via Apify (no rate limiting).
+    Uses Apify's Instagram actor to fetch the video, then ffmpeg to extract audio.
     Returns path to audio file.
     """
-    log.info(f"[1/6] extract audio via ScraperAPI: {instagram_link}")
+    log.info(f"[1/6] extract audio via Apify: {instagram_link}")
 
-    if not SCRAPER_API_KEY:
-        log.error("[1/6] SCRAPER_API_KEY not configured")
+    if not APIFY_API_TOKEN:
+        log.error("[1/6] APIFY_API_TOKEN not configured")
         raise RuntimeError(
-            "SCRAPER_API_KEY is not set in Railway Variables. "
-            "Set it to your ScraperAPI key from https://www.scraperapi.com"
+            "APIFY_API_TOKEN is not set in Railway Variables. "
+            "Set it to your Apify API token from https://apify.com/account/integrations"
         )
 
-    # Step 1: Use ScraperAPI to get the Instagram page (with video metadata)
-    log.info("[1/6] fetching Instagram page via ScraperAPI...")
+    # Step 1: Run Apify Instagram actor to download the video
+    log.info("[1/6] running Apify Instagram actor...")
+    client = ApifyClient(APIFY_API_TOKEN)
+
     try:
-        scraper_response = requests.get(
-            "https://api.scraperapi.com/",
-            params={
-                "api_key": SCRAPER_API_KEY,
-                "url": instagram_link,
-                "render": "false",
-            },
-            timeout=60,
-        )
-        scraper_response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        log.error(f"[1/6] ScraperAPI request failed: {e}")
-        raise RuntimeError(f"ScraperAPI failed to fetch page: {str(e)[:200]}") from e
+        run_input = {
+            "directUrls": [instagram_link],
+            "resultsLimit": 1,
+            "resultsType": "posts",
+        }
 
-    page_html = scraper_response.text
+        run = client.actor(APIFY_ACTOR_ID).call(run_input=run_input)
+        log.info(f"[1/6] Apify actor finished: {run['status']}")
 
-    # Step 2: Extract video URL from the HTML
-    # Instagram embeds video URLs in meta tags and JSON-LD data
-    # Look for video URLs in common patterns
-    log.info("[1/6] extracting video URL from page...")
+        # Fetch results from the dataset
+        results = list(client.dataset(run["defaultDatasetId"]).iterate_items())
 
-    # Pattern 1: og:video meta tag
-    video_url = None
-    import re as regex
+        if not results:
+            log.error("[1/6] Apify returned no results")
+            raise RuntimeError("Apify actor returned no video data. Video may be private or deleted.")
 
-    # Look for og:video meta tag
-    og_match = regex.search(r'<meta property="og:video" content="([^"]+)"', page_html)
-    if og_match:
-        video_url = og_match.group(1)
-        log.info(f"[1/6] found video URL in og:video: {video_url[:80]}...")
+        post = results[0]
+        log.info(f"[1/6] Apify found post by {post.get('ownerUsername', 'Unknown')}")
 
-    # Pattern 2: Look in JSON-LD data
-    if not video_url:
-        json_ld_match = regex.search(r'"contentUrl":\s*"([^"]*video[^"]*)"', page_html)
-        if json_ld_match:
-            video_url = json_ld_match.group(1)
-            log.info(f"[1/6] found video URL in JSON-LD: {video_url[:80]}...")
+        # Extract video URL from the result
+        # Apify returns multiple video URLs; use the first one
+        video_urls = post.get("videoUrl") or post.get("displayUrl")
 
-    # Pattern 3: Look for video src in script tags
-    if not video_url:
-        video_match = regex.search(r'"video":{"src":"([^"]+)"', page_html)
-        if video_match:
-            video_url = video_match.group(1)
-            log.info(f"[1/6] found video URL in video object: {video_url[:80]}...")
+        if not video_urls:
+            log.error(f"[1/6] No video URL in Apify response: {post.keys()}")
+            raise RuntimeError("Apify found the post but no video URL. May be a carousel or unsupported format.")
 
-    if not video_url:
-        log.error("[1/6] could not extract video URL from page HTML")
-        log.debug(f"[1/6] page HTML sample: {page_html[:500]}")
-        raise RuntimeError(
-            "Could not extract video URL from Instagram page. "
-            "The video may be private or Instagram's structure may have changed."
-        )
+        # Handle both single string and list of URLs
+        if isinstance(video_urls, list):
+            video_url = video_urls[0]
+        else:
+            video_url = video_urls
 
-    # Step 3: Download the video file
+        log.info(f"[1/6] extracted video URL: {video_url[:80]}...")
+
+    except Exception as e:
+        log.error(f"[1/6] Apify actor failed: {type(e).__name__}: {e}")
+        raise RuntimeError(f"Apify Instagram actor failed: {str(e)[:250]}") from e
+
+    # Step 2: Download the video file
     log.info("[1/6] downloading video file...")
+    import requests
     try:
         video_response = requests.get(video_url, timeout=120, stream=True)
         video_response.raise_for_status()
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         log.error(f"[1/6] video download failed: {e}")
-        raise RuntimeError(f"Failed to download video: {str(e)[:200]}") from e
+        raise RuntimeError(f"Failed to download video from URL: {str(e)[:200]}") from e
 
     video_path = os.path.join(work_dir, "video.mp4")
     try:
@@ -305,13 +296,14 @@ def extract_audio(instagram_link: str, work_dir: str) -> str:
             for chunk in video_response.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
-        log.info(f"[1/6] video downloaded: {os.path.getsize(video_path) / 1024 / 1024:.1f} MB")
+        video_size = os.path.getsize(video_path)
+        log.info(f"[1/6] video downloaded: {video_size / 1024 / 1024:.1f} MB")
     except Exception as e:
         log.error(f"[1/6] failed to write video file: {e}")
         raise RuntimeError(f"Failed to save video file: {str(e)[:200]}") from e
 
-    # Step 4: Extract audio from video using ffmpeg
-    log.info("[1/6] extracting audio from video...")
+    # Step 3: Extract audio from video using ffmpeg
+    log.info("[1/6] extracting audio from video with ffmpeg...")
     audio_path = os.path.join(work_dir, "audio.mp3")
     cmd = [
         "ffmpeg",
