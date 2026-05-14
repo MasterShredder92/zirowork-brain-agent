@@ -1,0 +1,29 @@
+# ─────────────────────────────────────────────────────────────
+# ZiroWork Brain Agent — Environment Variables
+# Copy this to .env in the backend/ directory and fill in values.
+# NEVER commit .env to version control.
+# ─────────────────────────────────────────────────────────────
+
+# OpenAI (Whisper transcription)
+OPENAI_API_KEY=sk-...
+
+# Anthropic (Claude processing)
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Google Drive
+# The folder ID from the Drive URL: drive.google.com/drive/folders/<FOLDER_ID>
+GOOGLE_DRIVE_FOLDER_ID=your_folder_id_here
+
+# Service account JSON (paste the full JSON as a single line)
+GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON={"type":"service_account","project_id":"..."}
+
+# Approved creators (comma-separated, no quotes)
+APPROVED_CREATORS=Andrew Huberman,Simon Willison,Andrej Karpathy
+
+# Content categories (comma-separated, no quotes)
+CONTENT_CATEGORIES=Agent Design,LLM Optimization,Product Strategy,AI Safety & Ethics,Technical Architecture,Business & Growth
+
+# Optional
+LOG_LEVEL=info
+TEMP_DIR=/tmp
+BACKEND_PORT=8000
