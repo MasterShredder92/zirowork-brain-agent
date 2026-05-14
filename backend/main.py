@@ -25,10 +25,11 @@ load_dotenv()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-    ]
+    ],
+    force=True,
 )
 log = logging.getLogger("brain-agent")
 
@@ -51,6 +52,26 @@ CONTENT_CATEGORIES = [c.strip() for c in os.getenv(
 
 CLAUDE_MODEL = "claude-opus-4-20250514"
 
+# ── Startup Validation ────────────────────────────────────────────────────────
+def validate_startup_config():
+    """Validate critical env vars at startup. Fail fast if misconfigured."""
+    errors = []
+
+    if not OPENAI_API_KEY:
+        errors.append("OPENAI_API_KEY is not set. Set it in Railway Variables.")
+    if not ANTHROPIC_API_KEY:
+        errors.append("ANTHROPIC_API_KEY is not set. Set it in Railway Variables.")
+
+    if errors:
+        log.error("STARTUP VALIDATION FAILED:")
+        for err in errors:
+            log.error(f"  - {err}")
+        raise RuntimeError("Missing critical configuration. See logs above.")
+
+    log.info("✓ Startup validation passed. All critical env vars configured.")
+
+validate_startup_config()
+
 # ── FastAPI App ───────────────────────────────────────────────────────────────
 app = FastAPI(title="ZiroWork Brain Agent", version="1.0.0")
 
@@ -61,6 +82,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def startup_event():
+    """Log startup confirmation."""
+    log.info(f"✓ ZiroWork Brain Agent started on port {os.getenv('PORT', '8000')}")
+    log.info(f"  - Approved creators: {len(APPROVED_CREATORS)}")
+    log.info(f"  - Content categories: {len(CONTENT_CATEGORIES)}")
 
 # ── Request / Response Models ─────────────────────────────────────────────────
 class ProcessVideoRequest(BaseModel):
@@ -122,7 +150,7 @@ def extract_audio(instagram_link: str, temp_dir: str) -> str:
             cmd,
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=120,
         )
         if result.returncode != 0:
             log.error(f"yt-dlp stderr: {result.stderr}")
@@ -136,7 +164,7 @@ def extract_audio(instagram_link: str, temp_dir: str) -> str:
 
         raise RuntimeError("yt-dlp ran but no audio file found.")
     except subprocess.TimeoutExpired:
-        raise RuntimeError("Audio extraction timed out (>5 min).")
+        raise RuntimeError("Audio extraction timed out (>2 min).")
 
 # ── Step 2: Transcribe ────────────────────────────────────────────────────────
 def transcribe_audio(audio_path: str) -> dict:
@@ -276,17 +304,19 @@ processed_by: Claude ({CLAUDE_MODEL})
     return front_matter + claude_output
 
 # ── Step 5: Save to Google Drive ──────────────────────────────────────────────
-def save_to_google_drive(content: str, filename: str) -> str:
+def save_to_google_drive(content: str, filename: str) -> Optional[str]:
     """
     Write markdown file to Google Drive folder.
-    Returns the Drive file URL.
+    Returns the Drive file URL, or None if failed (non-blocking).
     """
     log.info(f"[STEP 5] Saving to Google Drive: {filename}")
 
     if not GOOGLE_DRIVE_FOLDER_ID:
-        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID not configured.")
+        log.warning("[STEP 5] GOOGLE_DRIVE_FOLDER_ID not configured — skipping.")
+        return None
     if not GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON:
-        raise RuntimeError("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON not configured.")
+        log.warning("[STEP 5] GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON not configured — skipping.")
+        return None
 
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaInMemoryUpload
@@ -320,8 +350,8 @@ def save_to_google_drive(content: str, filename: str) -> str:
         log.info(f"[STEP 5] Saved to Drive: {drive_url}")
         return drive_url
     except Exception as e:
-        log.error(f"[STEP 5] Drive write failed: {e}")
-        raise RuntimeError(f"Google Drive write failed: {str(e)}")
+        log.error(f"[STEP 5] Drive write failed: {type(e).__name__}: {e}")
+        return None
 
 # ── Step 6: Cleanup ───────────────────────────────────────────────────────────
 def cleanup_temp_files(temp_dir: str):
@@ -381,20 +411,6 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
             code="INVALID_CATEGORY",
         )
 
-    # Check API keys
-    if not OPENAI_API_KEY:
-        return ProcessVideoResponse(
-            status="error",
-            error="OPENAI_API_KEY is not configured. Add it to your .env file.",
-            code="MISSING_CONFIG",
-        )
-    if not ANTHROPIC_API_KEY:
-        return ProcessVideoResponse(
-            status="error",
-            error="ANTHROPIC_API_KEY is not configured. Add it to your .env file.",
-            code="MISSING_CONFIG",
-        )
-
     today = datetime.now().strftime("%Y-%m-%d")
     filename = build_filename(req.creator, today)
     temp_dir = tempfile.mkdtemp(dir=TEMP_DIR, prefix="brain_agent_")
@@ -409,7 +425,7 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
             return ProcessVideoResponse(
                 status="error",
                 error=str(e),
-                code="INVALID_LINK",
+                code="EXTRACTION_FAILED",
             )
 
         # Step 2: Transcribe
@@ -417,10 +433,6 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
             transcription = transcribe_audio(audio_path)
             raw_transcript = transcription["text"]
         except RuntimeError as e:
-            # Save raw fallback note
-            raw_transcript = f"[TRANSCRIPTION FAILED: {e}]\n\nNo transcript available."
-            log.warning(f"Transcription failed, proceeding with fallback: {e}")
-            # Return partial error but don't crash
             return ProcessVideoResponse(
                 status="error",
                 error=f"Transcription failed: {str(e)}. Check your OpenAI API key and audio file.",
@@ -436,7 +448,6 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
                 source_url=req.instagram_link,
             )
         except RuntimeError as e:
-            # Save raw transcript with note
             claude_output = f"# Processing Failed\n\n**Note:** Claude processing failed. Raw transcript below.\n\n---\n\n{raw_transcript}"
             log.warning(f"Claude failed, saving raw transcript: {e}")
 
@@ -449,19 +460,13 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
             date=today,
         )
 
-        # Step 5: Save to Google Drive
-        if not GOOGLE_DRIVE_FOLDER_ID or not GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON:
-            log.warning("[STEP 5] Google Drive not configured — skipping Drive save.")
-            drive_url = None
-            message = "Processed successfully. Google Drive not configured — file not saved to Drive."
+        # Step 5: Save to Google Drive (non-blocking)
+        drive_url = save_to_google_drive(final_markdown, filename)
+        if drive_url:
+            message = f"✓ Saved to ZiroWork-Brain/Raw Videos/ → {filename}"
         else:
-            try:
-                drive_url = save_to_google_drive(final_markdown, filename)
-                message = f"Saved to ZiroWork-Brain/Raw Videos/ → {filename}"
-            except RuntimeError as e:
-                drive_url = None
-                message = f"Processing complete but Drive save failed: {str(e)}"
-                log.error(f"Drive save failed: {e}")
+            message = "⚠ Processed successfully. Google Drive save failed (check logs). Markdown not saved to Drive."
+            log.warning("[STEP 5] Drive write failed — markdown processed but not saved.")
 
         # Preview: first 1500 chars
         preview = final_markdown[:1500] + ("..." if len(final_markdown) > 1500 else "")
@@ -482,5 +487,12 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", os.getenv("BACKEND_PORT", "8000")))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+        log_level="info",
+        access_log=True,
+    )
