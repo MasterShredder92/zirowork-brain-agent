@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import requests
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -45,6 +46,7 @@ GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
 GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "")
 
 APPROVED_CREATORS = [
     c.strip()
@@ -219,36 +221,128 @@ def auto_categorize_transcript(transcript: str) -> str:
 
 # ── Step 1: extract audio ────────────────────────────────────────────────────
 def extract_audio(instagram_link: str, work_dir: str) -> str:
-    log.info(f"[1/6] extract audio: {instagram_link}")
-    output_template = os.path.join(work_dir, "audio.%(ext)s")
-    cmd = [
-        "yt-dlp",
-        "--extract-audio",
-        "--audio-format", "mp3",
-        "--audio-quality", "5",
-        "--no-playlist",
-        "--no-warnings",
-        "--output", output_template,
-    ]
-    if INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD:
-        cmd.extend(["-u", INSTAGRAM_USERNAME, "-p", INSTAGRAM_PASSWORD])
-    cmd.append(instagram_link)
+    """
+    Download audio from Instagram via ScraperAPI (avoids rate limiting).
+    Returns path to audio file.
+    """
+    log.info(f"[1/6] extract audio via ScraperAPI: {instagram_link}")
+
+    if not SCRAPER_API_KEY:
+        log.error("[1/6] SCRAPER_API_KEY not configured")
+        raise RuntimeError(
+            "SCRAPER_API_KEY is not set in Railway Variables. "
+            "Set it to your ScraperAPI key from https://www.scraperapi.com"
+        )
+
+    # Step 1: Use ScraperAPI to get the Instagram page (with video metadata)
+    log.info("[1/6] fetching Instagram page via ScraperAPI...")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=YTDLP_TIMEOUT_SEC)
+        scraper_response = requests.get(
+            "https://api.scraperapi.com/",
+            params={
+                "api_key": SCRAPER_API_KEY,
+                "url": instagram_link,
+                "render": "false",
+            },
+            timeout=60,
+        )
+        scraper_response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        log.error(f"[1/6] ScraperAPI request failed: {e}")
+        raise RuntimeError(f"ScraperAPI failed to fetch page: {str(e)[:200]}") from e
+
+    page_html = scraper_response.text
+
+    # Step 2: Extract video URL from the HTML
+    # Instagram embeds video URLs in meta tags and JSON-LD data
+    # Look for video URLs in common patterns
+    log.info("[1/6] extracting video URL from page...")
+
+    # Pattern 1: og:video meta tag
+    video_url = None
+    import re as regex
+
+    # Look for og:video meta tag
+    og_match = regex.search(r'<meta property="og:video" content="([^"]+)"', page_html)
+    if og_match:
+        video_url = og_match.group(1)
+        log.info(f"[1/6] found video URL in og:video: {video_url[:80]}...")
+
+    # Pattern 2: Look in JSON-LD data
+    if not video_url:
+        json_ld_match = regex.search(r'"contentUrl":\s*"([^"]*video[^"]*)"', page_html)
+        if json_ld_match:
+            video_url = json_ld_match.group(1)
+            log.info(f"[1/6] found video URL in JSON-LD: {video_url[:80]}...")
+
+    # Pattern 3: Look for video src in script tags
+    if not video_url:
+        video_match = regex.search(r'"video":{"src":"([^"]+)"', page_html)
+        if video_match:
+            video_url = video_match.group(1)
+            log.info(f"[1/6] found video URL in video object: {video_url[:80]}...")
+
+    if not video_url:
+        log.error("[1/6] could not extract video URL from page HTML")
+        log.debug(f"[1/6] page HTML sample: {page_html[:500]}")
+        raise RuntimeError(
+            "Could not extract video URL from Instagram page. "
+            "The video may be private or Instagram's structure may have changed."
+        )
+
+    # Step 3: Download the video file
+    log.info("[1/6] downloading video file...")
+    try:
+        video_response = requests.get(video_url, timeout=120, stream=True)
+        video_response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        log.error(f"[1/6] video download failed: {e}")
+        raise RuntimeError(f"Failed to download video: {str(e)[:200]}") from e
+
+    video_path = os.path.join(work_dir, "video.mp4")
+    try:
+        with open(video_path, "wb") as f:
+            for chunk in video_response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        log.info(f"[1/6] video downloaded: {os.path.getsize(video_path) / 1024 / 1024:.1f} MB")
+    except Exception as e:
+        log.error(f"[1/6] failed to write video file: {e}")
+        raise RuntimeError(f"Failed to save video file: {str(e)[:200]}") from e
+
+    # Step 4: Extract audio from video using ffmpeg
+    log.info("[1/6] extracting audio from video...")
+    audio_path = os.path.join(work_dir, "audio.mp3")
+    cmd = [
+        "ffmpeg",
+        "-i", video_path,
+        "-q:a", "5",
+        "-n",  # Don't overwrite if exists
+        audio_path,
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
     except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"audio extraction timed out after {YTDLP_TIMEOUT_SEC}s") from e
+        raise RuntimeError(f"ffmpeg timed out after 120s") from e
     except FileNotFoundError as e:
-        raise RuntimeError("yt-dlp not installed in this environment") from e
+        raise RuntimeError("ffmpeg not installed in this environment") from e
 
-    if result.returncode != 0:
-        log.error(f"[1/6] yt-dlp stderr: {result.stderr[:500]}")
-        raise RuntimeError(f"yt-dlp failed: {result.stderr.strip()[:300]}")
+    if result.returncode != 0 and not os.path.exists(audio_path):
+        log.error(f"[1/6] ffmpeg stderr: {result.stderr[:500]}")
+        raise RuntimeError(f"ffmpeg failed: {result.stderr.strip()[:300]}")
 
-    for f in Path(work_dir).iterdir():
-        if f.suffix in (".mp3", ".m4a", ".ogg", ".wav", ".opus"):
-            log.info(f"[1/6] audio: {f.name} ({f.stat().st_size / 1024:.1f} KB)")
-            return str(f)
-    raise RuntimeError("yt-dlp ran but produced no audio file")
+    if not os.path.exists(audio_path):
+        raise RuntimeError("ffmpeg ran but produced no audio file")
+
+    audio_size = os.path.getsize(audio_path)
+    log.info(f"[1/6] audio extracted: {audio_size / 1024:.1f} KB")
+    return audio_path
 
 
 # ── Step 2: transcribe ───────────────────────────────────────────────────────
