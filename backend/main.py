@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -66,22 +68,8 @@ YTDLP_TIMEOUT_SEC = 180
 # Repo-root-relative path to the built SPA. backend/main.py → ../dist/public.
 SPA_DIR = (Path(__file__).resolve().parent.parent / "dist" / "public").resolve()
 
-# ── App ──────────────────────────────────────────────────────────────────────
-app = FastAPI(title="ZiroWork Brain Agent", version="2.0.0")
-
-# Same-origin in production (FastAPI serves the SPA), but allow any in dev.
-_cors_origins = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[o.strip() for o in _cors_origins if o.strip()],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
-
-
-@app.on_event("startup")
-async def _on_startup() -> None:
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
     port = os.getenv("PORT", "8000")
     log.info(f"ZiroWork Brain Agent v2.0 starting on port {port}")
     log.info(f"  approved creators:  {len(APPROVED_CREATORS)}")
@@ -93,6 +81,21 @@ async def _on_startup() -> None:
         log.warning("  ANTHROPIC_API_KEY missing — /api/process-video will fail")
     if not (GOOGLE_DRIVE_FOLDER_ID and GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON):
         log.warning("  Google Drive not configured — markdown will be returned but not saved")
+    yield
+
+
+# ── App ──────────────────────────────────────────────────────────────────────
+app = FastAPI(title="ZiroWork Brain Agent", version="2.0.0", lifespan=_lifespan)
+
+# Same-origin in production (FastAPI serves the SPA), but allow any in dev.
+_cors_origins = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in _cors_origins if o.strip()],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 
 # ── Models ───────────────────────────────────────────────────────────────────
