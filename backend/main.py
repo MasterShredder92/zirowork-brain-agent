@@ -190,34 +190,28 @@ def extract_creator_from_metadata(instagram_link: str) -> str:
 
 
 def auto_categorize_transcript(transcript: str) -> str:
-    """Use Claude to pick a category from CONTENT_CATEGORIES based on transcript content."""
-    import anthropic
-
+    """Pick a category from CONTENT_CATEGORIES based on transcript keywords."""
     log.info(f"[3b/6] auto-categorizing transcript")
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    categories_str = ", ".join(CONTENT_CATEGORIES)
-    user_msg = (
-        f"Given this transcript, pick ONE category from the list that best fits the content. "
-        f"Categories: {categories_str}\n\n"
-        f"TRANSCRIPT (first 1500 chars):\n{transcript[:1500]}\n\n"
-        f"Respond with ONLY the category name, nothing else."
-    )
-    try:
-        resp = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=100,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        category = resp.content[0].text.strip()
+    transcript_lower = transcript.lower()
+
+    keyword_map = {
+        "Agent Design": ["agent", "agentic", "autonomous", "planning"],
+        "LLM Optimization": ["model", "llm", "training", "fine-tune", "inference", "prompt"],
+        "Product Strategy": ["product", "strategy", "market", "launch", "user"],
+        "AI Safety & Ethics": ["safety", "ethics", "alignment", "risk", "bias"],
+        "Technical Architecture": ["architecture", "system", "infrastructure", "scaling", "distributed"],
+        "Business & Growth": ["business", "growth", "monetization", "acquisition", "metric"],
+    }
+
+    scores = {cat: 0 for cat in CONTENT_CATEGORIES}
+    for category, keywords in keyword_map.items():
         if category in CONTENT_CATEGORIES:
-            log.info(f"[3b/6] auto-categorized: {category}")
-            return category
-        else:
-            log.warning(f"[3b/6] Claude returned unknown category '{category}', defaulting to first")
-            return CONTENT_CATEGORIES[0]
-    except Exception as e:
-        log.error(f"[3b/6] auto-categorize failed: {e}, defaulting to first category")
-        return CONTENT_CATEGORIES[0]
+            for keyword in keywords:
+                scores[category] += transcript_lower.count(keyword)
+
+    best_category = max(scores, key=scores.get)
+    log.info(f"[3b/6] auto-categorized: {best_category}")
+    return best_category
 
 
 # ── Step 1: extract audio ────────────────────────────────────────────────────
