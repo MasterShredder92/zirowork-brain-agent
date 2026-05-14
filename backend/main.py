@@ -43,6 +43,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
 GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
+INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
+INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
 
 APPROVED_CREATORS = [
     c.strip()
@@ -166,8 +168,10 @@ def extract_creator_from_metadata(instagram_link: str) -> str:
         "yt-dlp",
         "--dump-json",
         "--no-playlist",
-        instagram_link,
     ]
+    if INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD:
+        cmd.extend(["-u", INSTAGRAM_USERNAME, "-p", INSTAGRAM_PASSWORD])
+    cmd.append(instagram_link)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode == 0:
@@ -225,8 +229,10 @@ def extract_audio(instagram_link: str, work_dir: str) -> str:
         "--no-playlist",
         "--no-warnings",
         "--output", output_template,
-        instagram_link,
     ]
+    if INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD:
+        cmd.extend(["-u", INSTAGRAM_USERNAME, "-p", INSTAGRAM_PASSWORD])
+    cmd.append(instagram_link)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=YTDLP_TIMEOUT_SEC)
     except subprocess.TimeoutExpired as e:
