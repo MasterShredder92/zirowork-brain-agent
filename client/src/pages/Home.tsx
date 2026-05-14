@@ -1,15 +1,6 @@
-/* ============================================================
-   ZiroWork Brain Agent — Home Page
-   Design: ZiroWork design system
-   - Bebas Neue (display) + DM Sans (body)
-   - Lime #C5F135 primary, Purple #8B5CF6 secondary
-   - Dark mode only, zero border-radius, no shadows, no gradients
-   ============================================================ */
-
 import { useState, useEffect, useRef } from "react";
 import { Streamdown } from "streamdown";
 
-// ── Types ─────────────────────────────────────────────────────────────────────
 type StepStatus = "idle" | "running" | "done" | "error" | "skipped";
 
 interface PipelineStep {
@@ -27,22 +18,21 @@ interface ProcessResult {
   message?: string;
   error?: string;
   code?: string;
+  creator?: string;
+  category?: string;
 }
 
 const INITIAL_STEPS: PipelineStep[] = [
-  { id: 1, label: "Extract Audio",       description: "yt-dlp pulls audio from Instagram link",           status: "idle" },
-  { id: 2, label: "Transcribe",          description: "OpenAI Whisper converts speech to text",           status: "idle" },
-  { id: 3, label: "Process with Claude", description: "Claude cleans, structures, and expands transcript", status: "idle" },
-  { id: 4, label: "Format Markdown",     description: "YAML front matter + structured sections",          status: "idle" },
-  { id: 5, label: "Save to Drive",       description: "Write to ZiroWork-Brain/Raw Videos/",              status: "idle" },
-  { id: 6, label: "Cleanup",             description: "Delete temp audio files",                          status: "idle" },
+  { id: 1, label: "Extract Creator",      description: "Get uploader from Instagram metadata",          status: "idle" },
+  { id: 2, label: "Extract Audio",        description: "yt-dlp pulls audio from Instagram link",        status: "idle" },
+  { id: 3, label: "Transcribe",           description: "OpenAI Whisper converts speech to text",        status: "idle" },
+  { id: 4, label: "Auto-Categorize",      description: "Claude picks category from transcript",         status: "idle" },
+  { id: 5, label: "Process with Claude",  description: "Claude cleans, structures, and expands",        status: "idle" },
+  { id: 6, label: "Format Markdown",      description: "YAML front matter + structured sections",       status: "idle" },
+  { id: 7, label: "Save to Drive",        description: "Write to ZiroWork-Brain/Raw Videos/",           status: "idle" },
+  { id: 8, label: "Cleanup",              description: "Delete temp audio files",                       status: "idle" },
 ];
 
-// ── Backend URL ───────────────────────────────────────────────────────────────
-// Same-origin in prod (FastAPI serves the SPA). In dev, vite proxies /api → :8000.
-const BACKEND_URL = "";
-
-// ── Step Icon ─────────────────────────────────────────────────────────────────
 function StepIcon({ status }: { status: StepStatus }) {
   if (status === "done")    return <span style={{ color: "var(--lime)", fontSize: 14, fontWeight: 700 }}>✓</span>;
   if (status === "error")   return <span style={{ color: "var(--red)", fontSize: 14, fontWeight: 700 }}>✗</span>;
@@ -59,70 +49,21 @@ function PulseRing() {
   );
 }
 
-// ── Select wrapper ────────────────────────────────────────────────────────────
-function ZWSelect({
-  label, value, onChange, options, placeholder,
-}: {
-  label: string;
-  value: string;
-  onChange: (v: string) => void;
-  options: string[];
-  placeholder: string;
-}) {
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-      <label className="zw-label">{label}</label>
-      <div style={{ position: "relative" }}>
-        <select
-          className="zw-select"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-        >
-          <option value="">{placeholder}</option>
-          {options.map((o) => (
-            <option key={o} value={o}>{o}</option>
-          ))}
-        </select>
-        <span style={{
-          position: "absolute", right: 14, top: "50%", transform: "translateY(-50%)",
-          color: "var(--muted-color)", pointerEvents: "none", fontSize: 12,
-        }}>▼</span>
-      </div>
-    </div>
-  );
-}
-
-// ── Main Component ────────────────────────────────────────────────────────────
 export default function Home() {
   const [link, setLink]         = useState("");
-  const [creator, setCreator]   = useState("");
-  const [category, setCategory] = useState("");
   const [steps, setSteps]       = useState<PipelineStep[]>(INITIAL_STEPS);
   const [isRunning, setIsRunning] = useState(false);
   const [result, setResult]     = useState<ProcessResult | null>(null);
-  const [creators, setCreators] = useState<string[]>([]);
-  const [categories, setCategories] = useState<string[]>([]);
   const [backendStatus, setBackendStatus] = useState<"unknown" | "online" | "offline">("unknown");
   const resultRef = useRef<HTMLDivElement>(null);
 
-  // Load config from backend
   useEffect(() => {
-    fetch(`${BACKEND_URL}/api/config`)
+    fetch("/api/health")
       .then((r) => r.json())
-      .then((data) => {
-        setCreators(data.approved_creators || []);
-        setCategories(data.content_categories || []);
-        setBackendStatus("online");
-      })
-      .catch(() => {
-        // Fallback to defaults if backend not running
-        setCreators(["Andrew Huberman", "Simon Willison", "Andrej Karpathy"]);
-        setCategories(["Agent Design", "LLM Optimization", "Product Strategy", "AI Safety & Ethics", "Technical Architecture", "Business & Growth"]);
-        setBackendStatus("offline");
-      });
+      .then(() => setBackendStatus("online"))
+      .catch(() => setBackendStatus("offline"));
   }, []);
 
-  // Scroll to result when done
   useEffect(() => {
     if (result && resultRef.current) {
       resultRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -141,9 +82,8 @@ export default function Home() {
     setSteps((prev) => prev.map((s) => s.id > fromId ? { ...s, status: "skipped" } : s));
   }
 
-  // Simulate step-by-step progress while waiting for API
   async function simulateProgress(abortSignal: AbortSignal): Promise<void> {
-    const delays = [1200, 8000, 12000, 800, 1500, 400];
+    const delays = [800, 1200, 8000, 2000, 12000, 800, 1500, 400];
     for (let i = 0; i < INITIAL_STEPS.length; i++) {
       if (abortSignal.aborted) return;
       setStepStatus(i + 1, "running");
@@ -154,38 +94,30 @@ export default function Home() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!link || !creator || !category) return;
+    if (!link.trim()) return;
 
     setIsRunning(true);
     setResult(null);
     resetSteps();
 
     const abortController = new AbortController();
-
-    // Start simulated progress in parallel
     const progressPromise = simulateProgress(abortController.signal);
 
     try {
-      const response = await fetch(`${BACKEND_URL}/api/process-video`, {
+      const response = await fetch("/api/process-video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          instagram_link: link,
-          creator,
-          category,
-        }),
-        signal: AbortSignal.timeout(360_000), // 6 min timeout
+        body: JSON.stringify({ instagram_link: link }),
+        signal: AbortSignal.timeout(360_000),
       });
 
-      abortController.abort(); // Stop simulated progress
+      abortController.abort();
 
       const data: ProcessResult = await response.json();
 
       if (data.status === "success") {
-        // Mark all steps done
         setSteps(INITIAL_STEPS.map((s) => ({ ...s, status: "done" })));
       } else {
-        // Mark first step as error, rest as skipped
         setStepStatus(1, "error");
         markAllAfterError(1);
       }
@@ -214,7 +146,7 @@ export default function Home() {
     ? (steps.findIndex((s) => s.status === "running") + 1) / INITIAL_STEPS.length * 100
     : result?.status === "success" ? 100 : 0;
 
-  const canSubmit = link.trim() && creator && category && !isRunning;
+  const canSubmit = link.trim() && !isRunning;
 
   return (
     <div style={{ minHeight: "100vh", background: "var(--black)", color: "var(--text-color)" }}>
@@ -237,7 +169,7 @@ export default function Home() {
         <div className="zw-callout-purple" style={{ margin: 0, borderLeft: "none", borderBottom: "1px solid rgba(139,92,246,0.3)" }}>
           <div className="zw-wrap" style={{ padding: "10px 20px" }}>
             <span style={{ fontSize: 12, fontWeight: 600, letterSpacing: 1 }}>
-              Backend not reachable at /api — in dev, start it with: <code style={{ color: "var(--purple-glow)", background: "rgba(139,92,246,0.1)", padding: "2px 6px" }}>cd backend && python main.py</code>
+              Backend not detected — start it with: <code style={{ color: "var(--purple-glow)", background: "rgba(139,92,246,0.1)", padding: "2px 6px" }}>cd backend && python main.py</code>
             </span>
           </div>
         </div>
@@ -271,14 +203,14 @@ export default function Home() {
               margin: 0,
               maxWidth: 480,
             }}>
-              Paste an Instagram link. Get a clean markdown knowledge file in Google Drive — ready for Obsidian.
+              Paste an Instagram link. Auto-detects creator and topic. Get clean markdown in Google Drive.
             </p>
           </div>
 
           {/* ── Pipeline overview ── */}
           <div className="zw-callout" style={{ marginBottom: 32, fontSize: 13 }}>
             <span style={{ color: "var(--lime)", fontWeight: 700 }}>PIPELINE:</span>{" "}
-            Instagram Link → Audio Extract → Whisper Transcribe → Claude Process → Markdown → Google Drive
+            Link → Creator → Audio → Whisper → Auto-Categorize → Claude → Google Drive
           </div>
 
           {/* ── Form card ── */}
@@ -306,24 +238,6 @@ export default function Home() {
                     placeholder="https://www.instagram.com/reel/..."
                     disabled={isRunning}
                     required
-                  />
-                </div>
-
-                {/* Creator + Category row */}
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
-                  <ZWSelect
-                    label="Creator"
-                    value={creator}
-                    onChange={setCreator}
-                    options={creators}
-                    placeholder="Select creator..."
-                  />
-                  <ZWSelect
-                    label="Category"
-                    value={category}
-                    onChange={setCategory}
-                    options={categories}
-                    placeholder="Select category..."
                   />
                 </div>
 
@@ -432,16 +346,28 @@ export default function Home() {
                       }}>SAVED TO DRIVE</span>
                       <span style={{ color: "var(--lime)", fontSize: 16 }}>✓</span>
                     </div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                       <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                        <span className="zw-label" style={{ margin: 0, minWidth: 80 }}>FILENAME</span>
+                        <span className="zw-label" style={{ margin: 0, minWidth: 90 }}>FILENAME</span>
                         <span style={{ fontSize: 14, color: "var(--text-color)", fontFamily: "monospace" }}>
                           {result.filename}
                         </span>
                       </div>
+                      {result.creator && (
+                        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                          <span className="zw-label" style={{ margin: 0, minWidth: 90 }}>CREATOR</span>
+                          <span style={{ fontSize: 14, color: "var(--text-color)" }}>{result.creator}</span>
+                        </div>
+                      )}
+                      {result.category && (
+                        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                          <span className="zw-label" style={{ margin: 0, minWidth: 90 }}>CATEGORY</span>
+                          <span style={{ fontSize: 14, color: "var(--lime)" }}>{result.category}</span>
+                        </div>
+                      )}
                       {result.drive_url && (
                         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                          <span className="zw-label" style={{ margin: 0, minWidth: 80 }}>DRIVE</span>
+                          <span className="zw-label" style={{ margin: 0, minWidth: 90 }}>DRIVE</span>
                           <a
                             href={result.drive_url}
                             target="_blank"
@@ -459,7 +385,7 @@ export default function Home() {
                       )}
                       {result.message && (
                         <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-                          <span className="zw-label" style={{ margin: 0, minWidth: 80 }}>STATUS</span>
+                          <span className="zw-label" style={{ margin: 0, minWidth: 90 }}>STATUS</span>
                           <span style={{ fontSize: 13, color: "var(--muted-color)" }}>{result.message}</span>
                         </div>
                       )}
@@ -491,8 +417,6 @@ export default function Home() {
                       setResult(null);
                       resetSteps();
                       setLink("");
-                      setCreator("");
-                      setCategory("");
                     }}
                   >
                     PROCESS ANOTHER →
@@ -529,14 +453,14 @@ export default function Home() {
                   <div style={{ flex: 1 }}>
                     <div className="zw-badge-purple" style={{ marginBottom: 10, display: "inline-flex" }}>COST</div>
                     <div style={{ fontSize: 13, color: "var(--muted-color)", lineHeight: 1.6 }}>
-                      ~$0.10–0.17 per video<br />
-                      <span style={{ color: "var(--muted2-color)", fontSize: 12 }}>Whisper + Claude combined</span>
+                      ~$0.15–0.25 per video<br />
+                      <span style={{ color: "var(--muted2-color)", fontSize: 12 }}>Whisper + Claude x2</span>
                     </div>
                   </div>
                   <div style={{ flex: 1 }}>
                     <div className="zw-badge-purple" style={{ marginBottom: 10, display: "inline-flex" }}>SPEED</div>
                     <div style={{ fontSize: 13, color: "var(--muted-color)", lineHeight: 1.6 }}>
-                      &lt;5 min for 30-min video<br />
+                      &lt;6 min for 30-min video<br />
                       <span style={{ color: "var(--muted2-color)", fontSize: 12 }}>Audio extract → Drive save</span>
                     </div>
                   </div>
@@ -544,15 +468,15 @@ export default function Home() {
                     <div className="zw-badge-purple" style={{ marginBottom: 10, display: "inline-flex" }}>OUTPUT</div>
                     <div style={{ fontSize: 13, color: "var(--muted-color)", lineHeight: 1.6 }}>
                       Clean .md file<br />
-                      <span style={{ color: "var(--muted2-color)", fontSize: 12 }}>YAML front matter + Obsidian links</span>
+                      <span style={{ color: "var(--muted2-color)", fontSize: 12 }}>Auto-detected creator & category</span>
                     </div>
                   </div>
                 </div>
               </div>
 
               <div className="zw-callout" style={{ fontSize: 13 }}>
-                <strong style={{ color: "var(--lime)" }}>No video storage.</strong>{" "}
-                Audio is extracted, transcribed, and deleted. Only the markdown file is saved.
+                <strong style={{ color: "var(--lime)" }}>No creator or category required.</strong>{" "}
+                Creator auto-detected from video metadata, category auto-picked by Claude.
               </div>
             </div>
           )}
@@ -574,7 +498,7 @@ export default function Home() {
             ZIROWORK
           </span>
           <span style={{ fontSize: 11, color: "var(--muted2-color)", letterSpacing: 1 }}>
-            BRAIN AGENT v1.0 — INTELLIGENCE PROCESSOR
+            BRAIN AGENT v2.0 — AUTO-DETECT INTELLIGENCE PROCESSOR
           </span>
         </div>
       </footer>

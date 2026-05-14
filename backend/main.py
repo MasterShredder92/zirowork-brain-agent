@@ -101,8 +101,6 @@ app.add_middleware(
 # ── Models ───────────────────────────────────────────────────────────────────
 class ProcessVideoRequest(BaseModel):
     instagram_link: str
-    creator: str
-    category: str
 
 
 class ProcessVideoResponse(BaseModel):
@@ -113,6 +111,8 @@ class ProcessVideoResponse(BaseModel):
     message: Optional[str] = None
     error: Optional[str] = None
     code: Optional[str] = None
+    creator: Optional[str] = None
+    category: Optional[str] = None
 
 
 class ConfigResponse(BaseModel):
@@ -137,6 +137,69 @@ def _slugify(name: str) -> str:
 
 def _build_filename(creator: str, date: str) -> str:
     return f"{date}-{_slugify(creator)}.md"
+
+
+def extract_creator_from_metadata(instagram_link: str, work_dir: str) -> str:
+    """Extract creator/uploader name from Instagram video via yt-dlp metadata."""
+    log.info(f"[0/6] extract creator metadata: {instagram_link}")
+    cmd = [
+        "yt-dlp",
+        "--dump-json",
+        "--no-playlist",
+        instagram_link,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired as e:
+        log.warning(f"[0/6] metadata extraction timeout, falling back to 'Unknown Creator'")
+        return "Unknown Creator"
+    except FileNotFoundError as e:
+        log.warning(f"[0/6] yt-dlp not found, falling back to 'Unknown Creator'")
+        return "Unknown Creator"
+
+    if result.returncode != 0:
+        log.warning(f"[0/6] yt-dlp metadata failed: {result.stderr[:200]}, falling back")
+        return "Unknown Creator"
+
+    try:
+        data = json.loads(result.stdout)
+        uploader = data.get("uploader") or data.get("channel") or data.get("artist") or "Unknown Creator"
+        log.info(f"[0/6] extracted creator: {uploader}")
+        return uploader.strip()
+    except (json.JSONDecodeError, KeyError) as e:
+        log.warning(f"[0/6] failed to parse metadata: {e}, falling back")
+        return "Unknown Creator"
+
+
+def auto_categorize_transcript(transcript: str) -> str:
+    """Use Claude to pick a category from CONTENT_CATEGORIES based on transcript content."""
+    import anthropic
+
+    log.info(f"[3b/6] auto-categorizing transcript")
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    categories_str = ", ".join(CONTENT_CATEGORIES)
+    user_msg = (
+        f"Given this transcript, pick ONE category from the list that best fits the content. "
+        f"Categories: {categories_str}\n\n"
+        f"TRANSCRIPT (first 1500 chars):\n{transcript[:1500]}\n\n"
+        f"Respond with ONLY the category name, nothing else."
+    )
+    try:
+        resp = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=100,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        category = resp.content[0].text.strip()
+        if category in CONTENT_CATEGORIES:
+            log.info(f"[3b/6] auto-categorized: {category}")
+            return category
+        else:
+            log.warning(f"[3b/6] Claude returned unknown category '{category}', defaulting to first")
+            return CONTENT_CATEGORIES[0]
+    except Exception as e:
+        log.error(f"[3b/6] auto-categorize failed: {e}, defaulting to first category")
+        return CONTENT_CATEGORIES[0]
 
 
 # ── Step 1: extract audio ────────────────────────────────────────────────────
@@ -357,9 +420,7 @@ def get_config() -> ConfigResponse:
 
 @app.post("/api/process-video", response_model=ProcessVideoResponse)
 def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
-    log.info(
-        f"=== request: {req.creator} / {req.category} / {req.instagram_link[:60]} ==="
-    )
+    log.info(f"=== request: {req.instagram_link[:60]} ===")
 
     if not OPENAI_API_KEY or not ANTHROPIC_API_KEY:
         return ProcessVideoResponse(
@@ -373,24 +434,16 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
             error="Invalid Instagram link. Must be an instagram.com /reel/, /p/, or /tv/ URL.",
             code="INVALID_LINK",
         )
-    if req.creator not in APPROVED_CREATORS:
-        return ProcessVideoResponse(
-            status="error",
-            error=f"Creator '{req.creator}' is not in the approved list.",
-            code="INVALID_CREATOR",
-        )
-    if req.category not in CONTENT_CATEGORIES:
-        return ProcessVideoResponse(
-            status="error",
-            error=f"Category '{req.category}' is not valid.",
-            code="INVALID_CATEGORY",
-        )
 
     today = datetime.now().strftime("%Y-%m-%d")
-    filename = _build_filename(req.creator, today)
     work_dir = tempfile.mkdtemp(prefix="brain_agent_")
+    creator = None
+    category = None
 
     try:
+        creator = extract_creator_from_metadata(req.instagram_link, work_dir)
+        filename = _build_filename(creator, today)
+
         try:
             audio_path = extract_audio(req.instagram_link, work_dir)
         except RuntimeError as e:
@@ -405,11 +458,13 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
                 code="TRANSCRIPTION_FAILED",
             )
 
+        category = auto_categorize_transcript(transcript)
+
         try:
             claude_output = process_with_claude(
                 transcript=transcript,
-                creator=req.creator,
-                category=req.category,
+                creator=creator,
+                category=category,
                 source_url=req.instagram_link,
             )
         except RuntimeError as e:
@@ -421,7 +476,7 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
             )
 
         final_md = format_markdown(
-            claude_output, req.creator, req.category, req.instagram_link, today
+            claude_output, creator, category, req.instagram_link, today
         )
         drive_url = save_to_drive(final_md, filename)
         message = (
@@ -431,13 +486,15 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
         )
         preview = final_md[:1500] + ("..." if len(final_md) > 1500 else "")
 
-        log.info(f"=== done: {filename} ===")
+        log.info(f"=== done: {filename} ({creator} / {category}) ===")
         return ProcessVideoResponse(
             status="success",
             filename=filename,
             drive_url=drive_url,
             preview=preview,
             message=message,
+            creator=creator,
+            category=category,
         )
     finally:
         log.info(f"[6/6] cleanup: {work_dir}")
