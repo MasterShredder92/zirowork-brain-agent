@@ -458,7 +458,7 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
     category = None
 
     try:
-        creator = extract_creator_from_metadata(req.instagram_link, work_dir)
+        creator = extract_creator_from_metadata(req.instagram_link)
         filename = _build_filename(creator, today)
 
         try:
