@@ -42,7 +42,7 @@ log = logging.getLogger("brain-agent")
 # ── Config ───────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "1Ejmvt9V3oHEuU2CwRNVWjd51qvCr3xas").strip()
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "10oKB6NWeo8IbxQ6ZJ--7ckKz1F3Y5et0").strip()
 GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
@@ -541,6 +541,7 @@ def save_to_drive(content: str, filename: str) -> Tuple[Optional[str], Optional[
                 ),
                 fields="id, webViewLink",
                 supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
             )
             .execute()
         )
