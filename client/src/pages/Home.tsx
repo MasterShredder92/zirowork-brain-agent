@@ -1,6 +1,10 @@
 import { useState, useEffect, useRef } from "react";
 import { Streamdown } from "streamdown";
 
+// API base URL: use VITE_BACKEND_URL env var if set (for Manus/Vercel deploy),
+// otherwise use relative paths (works when Railway serves the SPA directly).
+const API_BASE = (import.meta.env.VITE_BACKEND_URL as string | undefined) ?? "";
+
 type StepStatus = "idle" | "running" | "done" | "error" | "skipped";
 
 interface PipelineStep {
@@ -58,7 +62,7 @@ export default function Home() {
   const resultRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    fetch("/api/health")
+    fetch(`${API_BASE}/api/health`)
       .then((r) => r.json())
       .then(() => setBackendStatus("online"))
       .catch(() => setBackendStatus("offline"));
@@ -104,7 +108,7 @@ export default function Home() {
     const progressPromise = simulateProgress(abortController.signal);
 
     try {
-      const response = await fetch("/api/process-video", {
+      const response = await fetch(`${API_BASE}/api/process-video`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ instagram_link: link }),
