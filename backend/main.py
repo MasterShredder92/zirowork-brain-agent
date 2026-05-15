@@ -44,6 +44,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "10oKB6NWeo8IbxQ6ZJ--7ckKz1F3Y5et0").strip()
 GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
+# OAuth credentials (preferred over service account — uses your personal Drive quota)
+# Set GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REFRESH_TOKEN in Railway Variables
+GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
+GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "").strip()
+GOOGLE_OAUTH_REFRESH_TOKEN = os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN", "").strip()
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
 APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN", "").strip()
@@ -508,25 +513,46 @@ def format_markdown(
 
 
 # ── Step 5: save to Google Drive ─────────────────────────────────────────────
+def _get_drive_credentials():
+    """Return OAuth2 credentials using refresh token (preferred) or service account."""
+    if GOOGLE_OAUTH_REFRESH_TOKEN and GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        creds = Credentials(
+            token=None,
+            refresh_token=GOOGLE_OAUTH_REFRESH_TOKEN,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=GOOGLE_OAUTH_CLIENT_ID,
+            client_secret=GOOGLE_OAUTH_CLIENT_SECRET,
+            scopes=["https://www.googleapis.com/auth/drive"],
+        )
+        creds.refresh(Request())
+        log.info("[5/6] using OAuth credentials (personal Drive quota)")
+        return creds
+    elif GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON:
+        from google.oauth2.service_account import Credentials
+        sa_info = json.loads(GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON)
+        creds = Credentials.from_service_account_info(
+            sa_info, scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        log.info("[5/6] using service account credentials")
+        return creds
+    return None
+
+
 def save_to_drive(content: str, filename: str) -> Tuple[Optional[str], Optional[str]]:
     log.info(f"[5/6] save to Drive: {filename}")
-    if not (GOOGLE_DRIVE_FOLDER_ID and GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON):
-        log.warning("[5/6] Drive not configured — skipping")
-        return None, "Google Drive is not configured. Set GOOGLE_DRIVE_FOLDER_ID and GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON in Railway Variables."
+    if not GOOGLE_DRIVE_FOLDER_ID:
+        return None, "GOOGLE_DRIVE_FOLDER_ID not set in Railway Variables."
 
-    from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaInMemoryUpload
 
-    service_account_email = "unknown service account"
-
     try:
-        sa_info = json.loads(GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON)
-        service_account_email = sa_info.get("client_email", service_account_email)
-        creds = Credentials.from_service_account_info(
-            sa_info, scopes=["https://www.googleapis.com/auth/drive"]
-        )
+        creds = _get_drive_credentials()
+        if not creds:
+            return None, "No Drive credentials configured. Set GOOGLE_OAUTH_REFRESH_TOKEN or GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON."
         service = build("drive", "v3", credentials=creds, cache_discovery=False)
         file = (
             service.files()
@@ -549,25 +575,14 @@ def save_to_drive(content: str, filename: str) -> Tuple[Optional[str], Optional[
         return url, None
     except HttpError as e:
         status = getattr(e.resp, "status", None)
+        reason = str(e).lower()
         if status == 404:
-            error = (
-                "Google Drive folder was not found by the configured service account. "
-                f"Set Railway GOOGLE_DRIVE_FOLDER_ID to a valid shared folder ID, or share the target folder with {service_account_email}. "
-                f"Current folder ID: {GOOGLE_DRIVE_FOLDER_ID}."
-            )
+            error = f"Drive folder not found: {GOOGLE_DRIVE_FOLDER_ID}. Check GOOGLE_DRIVE_FOLDER_ID in Railway."
         elif status == 403:
-            reason = str(e).lower()
             if "storagequotaexceeded" in reason or "quota" in reason:
-                error = (
-                    f"Google Drive storage quota exceeded for service account {service_account_email}. "
-                    "The file is being written to a folder you own — this should not consume service account quota. "
-                    "Ensure the folder is a regular My Drive folder (not a Shared Drive), shared with the service account as Editor."
-                )
+                error = "Google Drive storage quota exceeded on the authenticated account."
             else:
-                error = (
-                    "Google Drive permission denied (403). "
-                    f"Share the target folder with {service_account_email} as Editor, then retry."
-                )
+                error = f"Google Drive permission denied (403). Ensure the folder is shared with the authenticated account."
         else:
             error = f"Google Drive API error {status}: {e}"
         log.error(f"[5/6] Drive write failed: {error}")
@@ -592,7 +607,8 @@ def health() -> dict:
         "version": "2.0.1",
         "commit": commit,
         "spa_built": SPA_DIR.exists(),
-        "drive_configured": bool(GOOGLE_DRIVE_FOLDER_ID and GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON),
+        "drive_configured": bool(GOOGLE_DRIVE_FOLDER_ID and (GOOGLE_OAUTH_REFRESH_TOKEN or GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON)),
+        "drive_auth_method": "oauth" if GOOGLE_OAUTH_REFRESH_TOKEN else ("service_account" if GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON else "none"),
         "drive_folder_id": GOOGLE_DRIVE_FOLDER_ID[:8] + "..." if GOOGLE_DRIVE_FOLDER_ID else "not set",
         "claude_model": CLAUDE_MODEL,
         "openai_configured": bool(OPENAI_API_KEY),
