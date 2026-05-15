@@ -525,7 +525,7 @@ def save_to_drive(content: str, filename: str) -> Tuple[Optional[str], Optional[
         sa_info = json.loads(GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON)
         service_account_email = sa_info.get("client_email", service_account_email)
         creds = Credentials.from_service_account_info(
-            sa_info, scopes=["https://www.googleapis.com/auth/drive.file"]
+            sa_info, scopes=["https://www.googleapis.com/auth/drive"]
         )
         service = build("drive", "v3", credentials=creds, cache_discovery=False)
         file = (
@@ -540,6 +540,7 @@ def save_to_drive(content: str, filename: str) -> Tuple[Optional[str], Optional[
                     content.encode("utf-8"), mimetype="text/markdown", resumable=False
                 ),
                 fields="id, webViewLink",
+                supportsAllDrives=True,
             )
             .execute()
         )
@@ -555,10 +556,18 @@ def save_to_drive(content: str, filename: str) -> Tuple[Optional[str], Optional[
                 f"Current folder ID: {GOOGLE_DRIVE_FOLDER_ID}."
             )
         elif status == 403:
-            error = (
-                "Google Drive permission denied. "
-                f"Give Editor access on the target folder to {service_account_email}, then retry."
-            )
+            reason = str(e).lower()
+            if "storagequotaexceeded" in reason or "quota" in reason:
+                error = (
+                    f"Google Drive storage quota exceeded for service account {service_account_email}. "
+                    "The file is being written to a folder you own — this should not consume service account quota. "
+                    "Ensure the folder is a regular My Drive folder (not a Shared Drive), shared with the service account as Editor."
+                )
+            else:
+                error = (
+                    "Google Drive permission denied (403). "
+                    f"Share the target folder with {service_account_email} as Editor, then retry."
+                )
         else:
             error = f"Google Drive API error {status}: {e}"
         log.error(f"[5/6] Drive write failed: {error}")
