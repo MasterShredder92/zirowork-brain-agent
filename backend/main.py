@@ -1,34 +1,40 @@
 """
-ZiroWork Brain Agent — Backend API
-Pipeline: Instagram Link → Audio Extract → Whisper Transcribe → Claude Process → Markdown → Google Drive → Cleanup
+ZiroWork Brain Agent — single-service backend.
+
+Serves the built Vite SPA from dist/public/ at /, and the pipeline API at /api/*.
+Pipeline: Instagram link → yt-dlp audio → Whisper transcribe → Claude process →
+markdown → Google Drive → cleanup.
 """
 
-import os
-import re
+from __future__ import annotations
+
 import json
 import logging
-import tempfile
+import os
+import re
+import shutil
 import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
+from apify_client import ApifyClient
+
+from dotenv import load_dotenv
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from dotenv import load_dotenv
 
-# Load .env
 load_dotenv()
 
 # ── Logging ──────────────────────────────────────────────────────────────────
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-    ],
     force=True,
 )
 log = logging.getLogger("brain-agent")
@@ -38,63 +44,69 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
 GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
-TEMP_DIR = os.getenv("TEMP_DIR", "/tmp")
+INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
+INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
+APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN", "")
+APIFY_ACTOR_ID = "shu8hvrXbJbY3Eb9W"  # Instagram video downloader actor
 
-APPROVED_CREATORS = [c.strip() for c in os.getenv(
-    "APPROVED_CREATORS",
-    "Andrew Huberman,Simon Willison,Andrej Karpathy"
-).split(",") if c.strip()]
+APPROVED_CREATORS = [
+    c.strip()
+    for c in os.getenv(
+        "APPROVED_CREATORS", "Andrew Huberman,Simon Willison,Andrej Karpathy"
+    ).split(",")
+    if c.strip()
+]
+CONTENT_CATEGORIES = [
+    c.strip()
+    for c in os.getenv(
+        "CONTENT_CATEGORIES",
+        "Agent Design,LLM Optimization,Product Strategy,AI Safety & Ethics,"
+        "Technical Architecture,Business & Growth",
+    ).split(",")
+    if c.strip()
+]
 
-CONTENT_CATEGORIES = [c.strip() for c in os.getenv(
-    "CONTENT_CATEGORIES",
-    "Agent Design,LLM Optimization,Product Strategy,AI Safety & Ethics,Technical Architecture,Business & Growth"
-).split(",") if c.strip()]
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-20250514")
+WHISPER_MAX_BYTES = 25 * 1024 * 1024  # OpenAI hard limit
+YTDLP_TIMEOUT_SEC = 180
 
-CLAUDE_MODEL = "claude-opus-4-20250514"
+# Repo-root-relative path to the built SPA. backend/main.py → ../dist/public.
+SPA_DIR = (Path(__file__).resolve().parent.parent / "dist" / "public").resolve()
 
-# ── Startup Validation ────────────────────────────────────────────────────────
-def validate_startup_config():
-    """Validate critical env vars at startup. Fail fast if misconfigured."""
-    errors = []
-
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    port = os.getenv("PORT", "8000")
+    log.info(f"ZiroWork Brain Agent v2.0 starting on port {port}")
+    log.info(f"  approved creators:  {len(APPROVED_CREATORS)}")
+    log.info(f"  content categories: {len(CONTENT_CATEGORIES)}")
+    log.info(f"  SPA dir:            {SPA_DIR}  (exists={SPA_DIR.exists()})")
     if not OPENAI_API_KEY:
-        errors.append("OPENAI_API_KEY is not set. Set it in Railway Variables.")
+        log.warning("  OPENAI_API_KEY missing — /api/process-video will fail")
     if not ANTHROPIC_API_KEY:
-        errors.append("ANTHROPIC_API_KEY is not set. Set it in Railway Variables.")
+        log.warning("  ANTHROPIC_API_KEY missing — /api/process-video will fail")
+    if not (GOOGLE_DRIVE_FOLDER_ID and GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON):
+        log.warning("  Google Drive not configured — markdown will be returned but not saved")
+    yield
 
-    if errors:
-        log.error("STARTUP VALIDATION FAILED:")
-        for err in errors:
-            log.error(f"  - {err}")
-        raise RuntimeError("Missing critical configuration. See logs above.")
 
-    log.info("✓ Startup validation passed. All critical env vars configured.")
+# ── App ──────────────────────────────────────────────────────────────────────
+app = FastAPI(title="ZiroWork Brain Agent", version="2.0.0", lifespan=_lifespan)
 
-validate_startup_config()
-
-# ── FastAPI App ───────────────────────────────────────────────────────────────
-app = FastAPI(title="ZiroWork Brain Agent", version="1.0.0")
-
+# Same-origin in production (FastAPI serves the SPA), but allow any in dev.
+_cors_origins = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=[o.strip() for o in _cors_origins if o.strip()],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-async def startup_event():
-    """Log startup confirmation."""
-    log.info(f"✓ ZiroWork Brain Agent started on port {os.getenv('PORT', '8000')}")
-    log.info(f"  - Approved creators: {len(APPROVED_CREATORS)}")
-    log.info(f"  - Content categories: {len(CONTENT_CATEGORIES)}")
 
-# ── Request / Response Models ─────────────────────────────────────────────────
+# ── Models ───────────────────────────────────────────────────────────────────
 class ProcessVideoRequest(BaseModel):
     instagram_link: str
-    creator: str
-    category: str
+
 
 class ProcessVideoResponse(BaseModel):
     status: str
@@ -104,45 +116,194 @@ class ProcessVideoResponse(BaseModel):
     message: Optional[str] = None
     error: Optional[str] = None
     code: Optional[str] = None
+    creator: Optional[str] = None
+    category: Optional[str] = None
+
 
 class ConfigResponse(BaseModel):
     approved_creators: list[str]
     content_categories: list[str]
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def validate_instagram_link(link: str) -> bool:
-    """Basic validation for Instagram URLs."""
-    patterns = [
-        r"https?://(www\.)?instagram\.com/(p|reel|tv)/[\w-]+",
-        r"https?://(www\.)?instagram\.com/[\w.]+/(p|reel|tv)/[\w-]+",
-    ]
-    return any(re.match(p, link) for p in patterns)
 
-def slugify_creator(name: str) -> str:
-    """Convert 'Andrew Huberman' → 'andrew-huberman'."""
+# ── Helpers ──────────────────────────────────────────────────────────────────
+_INSTAGRAM_PATTERNS = [
+    re.compile(r"^https?://(www\.)?instagram\.com/(p|reel|tv)/[\w-]+"),
+    re.compile(r"^https?://(www\.)?instagram\.com/[\w.]+/(p|reel|tv)/[\w-]+"),
+]
+
+
+def _valid_instagram_link(link: str) -> bool:
+    return any(p.match(link) for p in _INSTAGRAM_PATTERNS)
+
+
+def _slugify(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
-def build_filename(creator: str, date: str) -> str:
-    return f"{date}-{slugify_creator(creator)}.md"
 
-# ── Step 1: Extract Audio ─────────────────────────────────────────────────────
-def extract_audio(instagram_link: str, temp_dir: str) -> str:
-    """
-    Use yt-dlp to extract audio from Instagram link.
-    Returns path to audio file.
-    """
-    log.info(f"[STEP 1] Extracting audio from: {instagram_link}")
-    output_template = os.path.join(temp_dir, "audio.%(ext)s")
+def _build_filename(creator: str, date: str) -> str:
+    return f"{date}-{_slugify(creator)}.md"
 
+
+def extract_creator_from_url(instagram_link: str) -> str:
+    """Extract creator handle from Instagram URL. Falls back to 'Unknown Creator' if not found."""
+    log.info(f"[0/6] extract creator from URL: {instagram_link}")
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(instagram_link)
+        path_parts = parsed.path.strip("/").split("/")
+        if path_parts and path_parts[0] and not path_parts[0] in ("reel", "p", "tv", "stories"):
+            creator = path_parts[0].replace(".", " ").title()
+            log.info(f"[0/6] extracted creator from URL: {creator}")
+            return creator
+    except Exception as e:
+        log.warning(f"[0/6] failed to parse URL: {e}")
+    log.warning("[0/6] couldn't extract creator from URL, using 'Unknown Creator'")
+    return "Unknown Creator"
+
+
+def extract_creator_from_metadata(instagram_link: str) -> str:
+    """
+    Extract creator/uploader name from Instagram video via yt-dlp metadata.
+    Falls back to URL parsing if metadata extraction fails (e.g., rate-limited).
+    """
+    log.info(f"[0/6] extract creator metadata: {instagram_link}")
     cmd = [
         "yt-dlp",
-        "--extract-audio",
-        "--audio-format", "mp3",
-        "--audio-quality", "5",
+        "--dump-json",
         "--no-playlist",
-        "--no-warnings",
-        "--output", output_template,
-        instagram_link,
+    ]
+    if INSTAGRAM_USERNAME and INSTAGRAM_PASSWORD:
+        cmd.extend(["-u", INSTAGRAM_USERNAME, "-p", INSTAGRAM_PASSWORD])
+    cmd.append(instagram_link)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            uploader = data.get("uploader") or data.get("channel") or data.get("artist")
+            if uploader:
+                log.info(f"[0/6] extracted creator from metadata: {uploader}")
+                return uploader.strip()
+    except Exception as e:
+        log.debug(f"[0/6] metadata extraction failed ({type(e).__name__}), trying URL parsing")
+
+    return extract_creator_from_url(instagram_link)
+
+
+def auto_categorize_transcript(transcript: str) -> str:
+    """Score categories by keyword frequency. No anthropic, no httpx."""
+    log.info(f"[3b/6] auto-categorizing transcript")
+    transcript_lower = transcript.lower()
+    scores = {cat: 0 for cat in CONTENT_CATEGORIES}
+
+    keyword_map = {
+        "Agent Design": ["agent", "agentic", "autonomous", "planning"],
+        "LLM Optimization": ["model", "llm", "training", "fine-tune", "inference", "prompt"],
+        "Product Strategy": ["product", "strategy", "market", "launch", "user"],
+        "AI Safety & Ethics": ["safety", "ethics", "alignment", "risk", "bias"],
+        "Technical Architecture": ["architecture", "system", "infrastructure", "scaling", "distributed"],
+        "Business & Growth": ["business", "growth", "monetization", "acquisition", "metric"],
+    }
+
+    for cat, keywords in keyword_map.items():
+        if cat in CONTENT_CATEGORIES:
+            scores[cat] = sum(transcript_lower.count(kw) for kw in keywords)
+
+    best = max(scores, key=scores.get)
+    log.info(f"[3b/6] auto-categorized: {best}")
+    return best
+
+
+# ── Step 1: extract audio ────────────────────────────────────────────────────
+def extract_audio(instagram_link: str, work_dir: str) -> str:
+    """
+    Download audio from Instagram via Apify (no rate limiting).
+    Uses Apify's Instagram actor to fetch the video, then ffmpeg to extract audio.
+    Returns path to audio file.
+    """
+    log.info(f"[1/6] extract audio via Apify: {instagram_link}")
+
+    if not APIFY_API_TOKEN:
+        log.error("[1/6] APIFY_API_TOKEN not configured")
+        raise RuntimeError(
+            "APIFY_API_TOKEN is not set in Railway Variables. "
+            "Set it to your Apify API token from https://apify.com/account/integrations"
+        )
+
+    # Step 1: Run Apify Instagram actor to download the video
+    log.info("[1/6] running Apify Instagram actor...")
+    client = ApifyClient(APIFY_API_TOKEN)
+
+    try:
+        run_input = {
+            "directUrls": [instagram_link],
+            "resultsLimit": 1,
+            "resultsType": "posts",
+        }
+
+        run = client.actor(APIFY_ACTOR_ID).call(run_input=run_input)
+        log.info(f"[1/6] Apify actor finished: {run['status']}")
+
+        # Fetch results from the dataset
+        results = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+
+        if not results:
+            log.error("[1/6] Apify returned no results")
+            raise RuntimeError("Apify actor returned no video data. Video may be private or deleted.")
+
+        post = results[0]
+        log.info(f"[1/6] Apify found post by {post.get('ownerUsername', 'Unknown')}")
+
+        # Extract video URL from the result
+        # Apify returns multiple video URLs; use the first one
+        video_urls = post.get("videoUrl") or post.get("displayUrl")
+
+        if not video_urls:
+            log.error(f"[1/6] No video URL in Apify response: {post.keys()}")
+            raise RuntimeError("Apify found the post but no video URL. May be a carousel or unsupported format.")
+
+        # Handle both single string and list of URLs
+        if isinstance(video_urls, list):
+            video_url = video_urls[0]
+        else:
+            video_url = video_urls
+
+        log.info(f"[1/6] extracted video URL: {video_url[:80]}...")
+
+    except Exception as e:
+        log.error(f"[1/6] Apify actor failed: {type(e).__name__}: {e}")
+        raise RuntimeError(f"Apify Instagram actor failed: {str(e)[:250]}") from e
+
+    # Step 2: Download the video file
+    log.info("[1/6] downloading video file...")
+    import requests
+    try:
+        video_response = requests.get(video_url, timeout=120, stream=True)
+        video_response.raise_for_status()
+    except Exception as e:
+        log.error(f"[1/6] video download failed: {e}")
+        raise RuntimeError(f"Failed to download video from URL: {str(e)[:200]}") from e
+
+    video_path = os.path.join(work_dir, "video.mp4")
+    try:
+        with open(video_path, "wb") as f:
+            for chunk in video_response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        video_size = os.path.getsize(video_path)
+        log.info(f"[1/6] video downloaded: {video_size / 1024 / 1024:.1f} MB")
+    except Exception as e:
+        log.error(f"[1/6] failed to write video file: {e}")
+        raise RuntimeError(f"Failed to save video file: {str(e)[:200]}") from e
+
+    # Step 3: Extract audio from video using ffmpeg
+    log.info("[1/6] extracting audio from video with ffmpeg...")
+    audio_path = os.path.join(work_dir, "audio.mp3")
+    cmd = [
+        "ffmpeg",
+        "-i", video_path,
+        "-q:a", "5",
+        "-n",  # Don't overwrite if exists
+        audio_path,
     ]
 
     try:
@@ -152,67 +313,53 @@ def extract_audio(instagram_link: str, temp_dir: str) -> str:
             text=True,
             timeout=120,
         )
-        if result.returncode != 0:
-            log.error(f"yt-dlp stderr: {result.stderr}")
-            raise RuntimeError(f"yt-dlp failed: {result.stderr[:300]}")
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"ffmpeg timed out after 120s") from e
+    except FileNotFoundError as e:
+        raise RuntimeError("ffmpeg not installed in this environment") from e
 
-        # Find the output file
-        for f in Path(temp_dir).iterdir():
-            if f.suffix in (".mp3", ".m4a", ".ogg", ".wav", ".opus"):
-                log.info(f"[STEP 1] Audio extracted: {f} ({f.stat().st_size / 1024:.1f} KB)")
-                return str(f)
+    if result.returncode != 0 and not os.path.exists(audio_path):
+        log.error(f"[1/6] ffmpeg stderr: {result.stderr[:500]}")
+        raise RuntimeError(f"ffmpeg failed: {result.stderr.strip()[:300]}")
 
-        raise RuntimeError("yt-dlp ran but no audio file found.")
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("Audio extraction timed out (>2 min).")
+    if not os.path.exists(audio_path):
+        raise RuntimeError("ffmpeg ran but produced no audio file")
 
-# ── Step 2: Transcribe ────────────────────────────────────────────────────────
-def transcribe_audio(audio_path: str) -> dict:
-    """
-    Transcribe audio using OpenAI Whisper API.
-    Returns dict with 'text' and 'segments'.
-    Retries up to 4 times with exponential backoff for transient network errors.
-    """
+    audio_size = os.path.getsize(audio_path)
+    log.info(f"[1/6] audio extracted: {audio_size / 1024:.1f} KB")
+    return audio_path
+
+
+# ── Step 2: transcribe ───────────────────────────────────────────────────────
+def transcribe_audio(audio_path: str) -> str:
     import openai
-    import time
 
-    log.info(f"[STEP 2] Transcribing: {audio_path}")
-    client = openai.OpenAI(
-        api_key=OPENAI_API_KEY,
-        timeout=120.0,
-        max_retries=0,  # We handle retries manually below
-    )
+    log.info(f"[2/6] transcribe: {audio_path}")
+    size = os.path.getsize(audio_path)
+    if size > WHISPER_MAX_BYTES:
+        raise RuntimeError(
+            f"audio is {size / 1024 / 1024:.1f} MB — Whisper rejects >25 MB"
+        )
 
-    file_size = os.path.getsize(audio_path)
-    if file_size > 25 * 1024 * 1024:
-        log.warning(f"[STEP 2] Audio file > 25MB ({file_size/1024/1024:.1f} MB). Whisper may reject it.")
+    client = openai.OpenAI(api_key=OPENAI_API_KEY)
+    try:
+        with open(audio_path, "rb") as f:
+            resp = client.audio.transcriptions.create(
+                file=f,
+                model="whisper-1",
+                language="en",
+                response_format="verbose_json",
+                timestamp_granularities=["segment"],
+            )
+    except Exception as e:
+        raise RuntimeError(f"Whisper API error: {e}") from e
 
-    last_error = None
-    for attempt in range(1, 5):  # 4 attempts total
-        try:
-            with open(audio_path, "rb") as f:
-                response = client.audio.transcriptions.create(
-                    file=f,
-                    model="whisper-1",
-                    language="en",
-                    response_format="verbose_json",
-                    timestamp_granularities=["segment"],
-                )
-            text = response.text
-            segments = getattr(response, "segments", [])
-            log.info(f"[STEP 2] Transcription complete (attempt {attempt}). {len(text)} chars, {len(segments)} segments.")
-            return {"text": text, "segments": segments}
-        except Exception as e:
-            last_error = e
-            wait = 2 ** attempt  # 2s, 4s, 8s, 16s
-            log.warning(f"[STEP 2] Whisper attempt {attempt}/4 failed: {type(e).__name__}: {e}. Retrying in {wait}s...")
-            if attempt < 4:
-                time.sleep(wait)
+    text = resp.text or ""
+    log.info(f"[2/6] transcript: {len(text)} chars")
+    return text
 
-    log.error(f"[STEP 2] Whisper failed after 4 attempts: {last_error}")
-    raise RuntimeError(f"Transcription failed: {str(last_error)}")
 
-# ── Step 3: Process with Claude ───────────────────────────────────────────────
+# ── Step 3: process with Claude ──────────────────────────────────────────────
 CLAUDE_SYSTEM_PROMPT = """You are the intelligence processor for ZiroWork's Research Brain.
 
 Transform raw video transcripts into clean, actionable markdown for an Obsidian knowledge base.
@@ -261,246 +408,253 @@ OUTPUT FORMAT:
 
 OUTPUT MARKDOWN ONLY. NO PREAMBLE. JUST THE MARKDOWN."""
 
+
 def process_with_claude(transcript: str, creator: str, category: str, source_url: str) -> str:
-    """
-    Send transcript to Claude for cleaning and structuring.
-    Returns clean markdown string.
-    """
     import anthropic
 
-    log.info(f"[STEP 3] Processing with Claude ({CLAUDE_MODEL})")
+    log.info(f"[3/6] Claude ({CLAUDE_MODEL})")
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    user_message = f"""Creator: {creator}
-Category: {category}
-Source: {source_url}
-
-TRANSCRIPT:
-{transcript}"""
-
+    user = (
+        f"Creator: {creator}\n"
+        f"Category: {category}\n"
+        f"Source: {source_url}\n\n"
+        f"TRANSCRIPT:\n{transcript}"
+    )
     try:
-        response = client.messages.create(
+        resp = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=2000,
             system=CLAUDE_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
+            messages=[{"role": "user", "content": user}],
         )
-        result = response.content[0].text
-        log.info(f"[STEP 3] Claude output: {len(result)} chars")
-        return result
     except Exception as e:
-        log.error(f"[STEP 3] Claude failed: {e}")
-        raise RuntimeError(f"Claude processing failed: {str(e)}")
+        raise RuntimeError(f"Claude API error: {e}") from e
 
-# ── Step 4: Format Markdown ───────────────────────────────────────────────────
+    out = resp.content[0].text
+    log.info(f"[3/6] Claude output: {len(out)} chars")
+    return out
+
+
+# ── Step 4: format markdown ──────────────────────────────────────────────────
 def format_markdown(
-    claude_output: str,
-    creator: str,
-    category: str,
-    source_url: str,
-    date: str,
-    duration: str = "unknown",
+    body: str, creator: str, category: str, source_url: str, date: str
 ) -> str:
-    """Wrap Claude output with YAML front matter."""
-    log.info("[STEP 4] Formatting markdown with front matter")
-    front_matter = f"""---
-date: {date}
-creator: {creator}
-category: {category}
-source_url: {source_url}
-duration: {duration}
-processed_by: Claude ({CLAUDE_MODEL})
----
+    front_matter = (
+        "---\n"
+        f"date: {date}\n"
+        f"creator: {creator}\n"
+        f"category: {category}\n"
+        f"source_url: {source_url}\n"
+        f"processed_by: Claude ({CLAUDE_MODEL})\n"
+        "---\n\n"
+        f"**Source:** [{creator}]({source_url}) | **Date:** {date}\n\n"
+    )
+    return front_matter + body
 
-**Source:** [{creator}]({source_url}) | **Date:** {date} | **Duration:** {duration}
 
-"""
-    return front_matter + claude_output
+# ── Step 5: save to Google Drive ─────────────────────────────────────────────
+def save_to_drive(content: str, filename: str) -> Tuple[Optional[str], Optional[str]]:
+    log.info(f"[5/6] save to Drive: {filename}")
+    if not (GOOGLE_DRIVE_FOLDER_ID and GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON):
+        log.warning("[5/6] Drive not configured — skipping")
+        return None, "Google Drive is not configured. Set GOOGLE_DRIVE_FOLDER_ID and GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON in Railway Variables."
 
-# ── Step 5: Save to Google Drive ──────────────────────────────────────────────
-def save_to_google_drive(content: str, filename: str) -> Optional[str]:
-    """
-    Write markdown file to Google Drive folder.
-    Returns the Drive file URL, or None if failed (non-blocking).
-    """
-    log.info(f"[STEP 5] Saving to Google Drive: {filename}")
-
-    if not GOOGLE_DRIVE_FOLDER_ID:
-        log.warning("[STEP 5] GOOGLE_DRIVE_FOLDER_ID not configured — skipping.")
-        return None
-    if not GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON:
-        log.warning("[STEP 5] GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON not configured — skipping.")
-        return None
-
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaInMemoryUpload
     from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    from googleapiclient.http import MediaInMemoryUpload
+
+    service_account_email = "unknown service account"
 
     try:
         sa_info = json.loads(GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON)
+        service_account_email = sa_info.get("client_email", service_account_email)
         creds = Credentials.from_service_account_info(
-            sa_info,
-            scopes=["https://www.googleapis.com/auth/drive.file"],
+            sa_info, scopes=["https://www.googleapis.com/auth/drive.file"]
         )
-        service = build("drive", "v3", credentials=creds)
-
-        file_metadata = {
-            "name": filename,
-            "parents": [GOOGLE_DRIVE_FOLDER_ID],
-            "mimeType": "text/markdown",
-        }
-        media = MediaInMemoryUpload(
-            content.encode("utf-8"),
-            mimetype="text/markdown",
-            resumable=False,
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        file = (
+            service.files()
+            .create(
+                body={
+                    "name": filename,
+                    "parents": [GOOGLE_DRIVE_FOLDER_ID],
+                    "mimeType": "text/markdown",
+                },
+                media_body=MediaInMemoryUpload(
+                    content.encode("utf-8"), mimetype="text/markdown", resumable=False
+                ),
+                fields="id, webViewLink",
+            )
+            .execute()
         )
-        file = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields="id, webViewLink",
-        ).execute()
-
-        drive_url = file.get("webViewLink", f"https://drive.google.com/file/d/{file['id']}/view")
-        log.info(f"[STEP 5] Saved to Drive: {drive_url}")
-        return drive_url
+        url = file.get("webViewLink") or f"https://drive.google.com/file/d/{file['id']}/view"
+        log.info(f"[5/6] saved: {url}")
+        return url, None
+    except HttpError as e:
+        status = getattr(e.resp, "status", None)
+        if status == 404:
+            error = (
+                "Google Drive folder was not found by the configured service account. "
+                f"Set Railway GOOGLE_DRIVE_FOLDER_ID to a valid shared folder ID, or share the target folder with {service_account_email}. "
+                f"Current folder ID: {GOOGLE_DRIVE_FOLDER_ID}."
+            )
+        elif status == 403:
+            error = (
+                "Google Drive permission denied. "
+                f"Give Editor access on the target folder to {service_account_email}, then retry."
+            )
+        else:
+            error = f"Google Drive API error {status}: {e}"
+        log.error(f"[5/6] Drive write failed: {error}")
+        return None, error
     except Exception as e:
-        log.error(f"[STEP 5] Drive write failed: {type(e).__name__}: {e}")
-        return None
+        error = f"Google Drive write failed: {type(e).__name__}: {e}"
+        log.error(f"[5/6] {error}")
+        return None, error
 
-# ── Step 6: Cleanup ───────────────────────────────────────────────────────────
-def cleanup_temp_files(temp_dir: str):
-    """Delete temporary audio files."""
-    log.info(f"[STEP 6] Cleaning up: {temp_dir}")
-    try:
-        import shutil
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        log.info("[STEP 6] Cleanup complete.")
-    except Exception as e:
-        log.warning(f"[STEP 6] Cleanup warning (non-blocking): {e}")
 
-# ── Routes ────────────────────────────────────────────────────────────────────
-@app.get("/api/config")
+# ── API routes ───────────────────────────────────────────────────────────────
+@app.get("/api/health")
+def health() -> dict:
+    return {
+        "status": "ok",
+        "service": "ZiroWork Brain Agent",
+        "version": "2.0.0",
+        "spa_built": SPA_DIR.exists(),
+        "drive_configured": bool(GOOGLE_DRIVE_FOLDER_ID and GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON),
+        "openai_configured": bool(OPENAI_API_KEY),
+        "anthropic_configured": bool(ANTHROPIC_API_KEY),
+    }
+
+
+@app.get("/api/config", response_model=ConfigResponse)
 def get_config() -> ConfigResponse:
-    """Return approved creators and content categories."""
     return ConfigResponse(
         approved_creators=APPROVED_CREATORS,
         content_categories=CONTENT_CATEGORIES,
     )
 
-@app.get("/api/health")
-def health():
-    return {"status": "ok", "service": "ZiroWork Brain Agent"}
 
-@app.post("/api/process-video")
+@app.post("/api/process-video", response_model=ProcessVideoResponse)
 def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
-    """
-    Main pipeline endpoint.
-    POST /api/process-video
-    { instagram_link, creator, category }
-    """
-    log.info(f"=== NEW REQUEST: {req.creator} / {req.category} / {req.instagram_link[:60]} ===")
+    log.info(f"=== request: {req.instagram_link[:60]} ===")
 
-    # Validate link
-    if not validate_instagram_link(req.instagram_link):
-        log.warning(f"Invalid Instagram link: {req.instagram_link}")
+    if not OPENAI_API_KEY or not ANTHROPIC_API_KEY:
         return ProcessVideoResponse(
             status="error",
-            error="Invalid Instagram link. Must be an instagram.com/reel/, /p/, or /tv/ URL.",
+            error="Server is missing OPENAI_API_KEY or ANTHROPIC_API_KEY. Set them in Railway Variables.",
+            code="MISSING_CONFIG",
+        )
+    if not _valid_instagram_link(req.instagram_link):
+        return ProcessVideoResponse(
+            status="error",
+            error="Invalid Instagram link. Must be an instagram.com /reel/, /p/, or /tv/ URL.",
             code="INVALID_LINK",
         )
 
-    # Validate creator
-    if req.creator not in APPROVED_CREATORS:
-        return ProcessVideoResponse(
-            status="error",
-            error=f"Creator '{req.creator}' is not in the approved list.",
-            code="INVALID_CREATOR",
-        )
-
-    # Validate category
-    if req.category not in CONTENT_CATEGORIES:
-        return ProcessVideoResponse(
-            status="error",
-            error=f"Category '{req.category}' is not valid.",
-            code="INVALID_CATEGORY",
-        )
-
     today = datetime.now().strftime("%Y-%m-%d")
-    filename = build_filename(req.creator, today)
-    temp_dir = tempfile.mkdtemp(dir=TEMP_DIR, prefix="brain_agent_")
-    raw_transcript = ""
-    audio_path = None
+    work_dir = tempfile.mkdtemp(prefix="brain_agent_")
+    creator = None
+    category = None
 
     try:
-        # Step 1: Extract audio
-        try:
-            audio_path = extract_audio(req.instagram_link, temp_dir)
-        except RuntimeError as e:
-            return ProcessVideoResponse(
-                status="error",
-                error=str(e),
-                code="EXTRACTION_FAILED",
-            )
+        creator = extract_creator_from_metadata(req.instagram_link)
+        filename = _build_filename(creator, today)
 
-        # Step 2: Transcribe
         try:
-            transcription = transcribe_audio(audio_path)
-            raw_transcript = transcription["text"]
+            audio_path = extract_audio(req.instagram_link, work_dir)
+        except RuntimeError as e:
+            return ProcessVideoResponse(status="error", error=str(e), code="EXTRACTION_FAILED")
+
+        try:
+            transcript = transcribe_audio(audio_path)
         except RuntimeError as e:
             return ProcessVideoResponse(
                 status="error",
-                error=f"Transcription failed: {str(e)}. Check your OpenAI API key and audio file.",
+                error=f"Transcription failed: {e}. Check your OpenAI API key and audio file.",
                 code="TRANSCRIPTION_FAILED",
             )
 
-        # Step 3: Process with Claude
+        category = auto_categorize_transcript(transcript)
+
         try:
             claude_output = process_with_claude(
-                transcript=raw_transcript,
-                creator=req.creator,
-                category=req.category,
+                transcript=transcript,
+                creator=creator,
+                category=category,
                 source_url=req.instagram_link,
             )
         except RuntimeError as e:
-            claude_output = f"# Processing Failed\n\n**Note:** Claude processing failed. Raw transcript below.\n\n---\n\n{raw_transcript}"
-            log.warning(f"Claude failed, saving raw transcript: {e}")
+            log.warning(f"Claude failed, falling back to raw transcript: {e}")
+            claude_output = (
+                "# Processing Failed\n\n"
+                "**Note:** Claude processing failed. Raw transcript below.\n\n---\n\n"
+                + transcript
+            )
 
-        # Step 4: Format markdown
-        final_markdown = format_markdown(
-            claude_output=claude_output,
-            creator=req.creator,
-            category=req.category,
-            source_url=req.instagram_link,
-            date=today,
+        final_md = format_markdown(
+            claude_output, creator, category, req.instagram_link, today
         )
+        drive_url, drive_error = save_to_drive(final_md, filename)
+        message = (
+            f"Saved to Google Drive: {filename}"
+            if drive_url
+            else f"Processed successfully, but Google Drive save failed: {drive_error}"
+        )
+        preview = final_md[:1500] + ("..." if len(final_md) > 1500 else "")
 
-        # Step 5: Save to Google Drive (non-blocking)
-        drive_url = save_to_google_drive(final_markdown, filename)
-        if drive_url:
-            message = f"✓ Saved to ZiroWork-Brain/Raw Videos/ → {filename}"
-        else:
-            message = "⚠ Processed successfully. Google Drive save failed (check logs). Markdown not saved to Drive."
-            log.warning("[STEP 5] Drive write failed — markdown processed but not saved.")
-
-        # Preview: first 1500 chars
-        preview = final_markdown[:1500] + ("..." if len(final_markdown) > 1500 else "")
-
-        log.info(f"=== SUCCESS: {filename} ===")
+        log.info(f"=== done: {filename} ({creator} / {category}) ===")
         return ProcessVideoResponse(
             status="success",
             filename=filename,
             drive_url=drive_url,
             preview=preview,
             message=message,
+            creator=creator,
+            category=category,
         )
-
     finally:
-        # Step 6: Cleanup
-        cleanup_temp_files(temp_dir)
+        log.info(f"[6/6] cleanup: {work_dir}")
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ── SPA serving (must be registered after /api routes) ───────────────────────
+if SPA_DIR.exists():
+    # Serve hashed assets directly. Skip the mount if the assets dir is missing
+    # (StaticFiles raises on a non-existent directory).
+    _assets_dir = SPA_DIR / "assets"
+    if _assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(_assets_dir)), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa_fallback(full_path: str):
+        # Anything under /api/* that wasn't matched above → 404 JSON, not index.html.
+        if full_path.startswith("api/"):
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+        # Try to serve a real file (favicon, robots.txt, etc.).
+        candidate = (SPA_DIR / full_path).resolve()
+        if (
+            candidate.is_file()
+            and SPA_DIR in candidate.parents
+        ):
+            return FileResponse(candidate)
+        # Otherwise hand the SPA index.html and let wouter handle the route.
+        index = SPA_DIR / "index.html"
+        if index.is_file():
+            return FileResponse(index)
+        raise HTTPException(status_code=404, detail="SPA not built")
+else:
+    log.warning(
+        "SPA build not found at %s — only /api/* will respond. "
+        "Run `pnpm build` before starting in production.",
+        SPA_DIR,
+    )
 
 
 if __name__ == "__main__":
     import uvicorn
+
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(
         "main:app",
