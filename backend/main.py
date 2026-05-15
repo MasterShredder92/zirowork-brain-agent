@@ -448,29 +448,46 @@ OUTPUT MARKDOWN ONLY. NO PREAMBLE. JUST THE MARKDOWN."""
 
 
 def process_with_claude(transcript: str, creator: str, category: str, source_url: str) -> str:
-    import anthropic
+    """
+    Process transcript with Claude using raw httpx POST.
+    Bypasses the Anthropic SDK connection handling that may fail on Railway.
+    """
+    import httpx
 
     log.info(f"[3/6] Claude ({CLAUDE_MODEL})")
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     user = (
         f"Creator: {creator}\n"
         f"Category: {category}\n"
         f"Source: {source_url}\n\n"
         f"TRANSCRIPT:\n{transcript}"
     )
+    payload = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": 4000,
+        "system": CLAUDE_SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": user}],
+    }
     try:
-        resp = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=2000,
-            system=CLAUDE_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user}],
-        )
+        with httpx.Client(timeout=120.0) as client:
+            resp = client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json=payload,
+            )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Claude HTTP {resp.status_code}: {resp.text[:500]}")
+        data = resp.json()
+        out = data["content"][0]["text"]
+        log.info(f"[3/6] Claude output: {len(out)} chars")
+        return out
+    except RuntimeError:
+        raise
     except Exception as e:
-        raise RuntimeError(f"Claude API error: {e}") from e
-
-    out = resp.content[0].text
-    log.info(f"[3/6] Claude output: {len(out)} chars")
-    return out
+        raise RuntimeError(f"Claude API error: {type(e).__name__}: {e}") from e
 
 
 # ── Step 4: format markdown ──────────────────────────────────────────────────
