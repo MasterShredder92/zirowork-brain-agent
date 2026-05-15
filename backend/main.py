@@ -42,7 +42,7 @@ log = logging.getLogger("brain-agent")
 # ── Config ───────────────────────────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "1Ejmvt9V3oHEuU2CwRNVWjd51qvCr3xas").strip()
 GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
@@ -66,7 +66,7 @@ CONTENT_CATEGORIES = [
     if c.strip()
 ]
 
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-20250514")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-7")  # claude-opus-4-20250514 deprecated April 14 2026
 WHISPER_MAX_BYTES = 25 * 1024 * 1024  # OpenAI hard limit
 YTDLP_TIMEOUT_SEC = 180
 
