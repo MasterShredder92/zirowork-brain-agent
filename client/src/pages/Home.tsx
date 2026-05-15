@@ -1,9 +1,19 @@
 import { useState, useEffect, useRef } from "react";
 import { Streamdown } from "streamdown";
 
-// API base URL: use VITE_BACKEND_URL env var if set (for Manus/Vercel deploy),
-// otherwise use relative paths (works when Railway serves the SPA directly).
-const API_BASE = (import.meta.env.VITE_BACKEND_URL as string | undefined) ?? "";
+// API base URL:
+// - VITE_BACKEND_URL env var if set at build time (override)
+// - Hardcoded Railway URL if the current origin is NOT Railway (i.e., Manus/Vercel deploy)
+// - Empty string (relative) if already on Railway (same-origin)
+const RAILWAY_URL = "https://zirowork-brain-agent-production.up.railway.app";
+const API_BASE: string = (() => {
+  const envUrl = import.meta.env.VITE_BACKEND_URL as string | undefined;
+  if (envUrl) return envUrl.replace(/\/$/, "");
+  // If running on the Railway domain itself, use relative paths (same-origin)
+  if (typeof window !== "undefined" && window.location.hostname.endsWith("railway.app")) return "";
+  // Otherwise (Manus, Vercel, local dev with no proxy) — call Railway directly
+  return RAILWAY_URL;
+})();
 
 type StepStatus = "idle" | "running" | "done" | "error" | "skipped";
 
