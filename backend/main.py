@@ -572,12 +572,20 @@ def save_to_drive(content: str, filename: str) -> Tuple[Optional[str], Optional[
 # ── API routes ───────────────────────────────────────────────────────────────
 @app.get("/api/health")
 def health() -> dict:
+    import subprocess
+    try:
+        commit = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        commit = os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown")[:7]
     return {
         "status": "ok",
         "service": "ZiroWork Brain Agent",
-        "version": "2.0.0",
+        "version": "2.0.1",
+        "commit": commit,
         "spa_built": SPA_DIR.exists(),
         "drive_configured": bool(GOOGLE_DRIVE_FOLDER_ID and GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON),
+        "drive_folder_id": GOOGLE_DRIVE_FOLDER_ID[:8] + "..." if GOOGLE_DRIVE_FOLDER_ID else "not set",
+        "claude_model": CLAUDE_MODEL,
         "openai_configured": bool(OPENAI_API_KEY),
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
     }
