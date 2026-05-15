@@ -171,32 +171,46 @@ def transcribe_audio(audio_path: str) -> dict:
     """
     Transcribe audio using OpenAI Whisper API.
     Returns dict with 'text' and 'segments'.
+    Retries up to 4 times with exponential backoff for transient network errors.
     """
     import openai
+    import time
 
     log.info(f"[STEP 2] Transcribing: {audio_path}")
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
+    client = openai.OpenAI(
+        api_key=OPENAI_API_KEY,
+        timeout=120.0,
+        max_retries=0,  # We handle retries manually below
+    )
 
     file_size = os.path.getsize(audio_path)
     if file_size > 25 * 1024 * 1024:
         log.warning(f"[STEP 2] Audio file > 25MB ({file_size/1024/1024:.1f} MB). Whisper may reject it.")
 
-    try:
-        with open(audio_path, "rb") as f:
-            response = client.audio.transcriptions.create(
-                file=f,
-                model="whisper-1",
-                language="en",
-                response_format="verbose_json",
-                timestamp_granularities=["segment"],
-            )
-        text = response.text
-        segments = getattr(response, "segments", [])
-        log.info(f"[STEP 2] Transcription complete. {len(text)} chars, {len(segments)} segments.")
-        return {"text": text, "segments": segments}
-    except Exception as e:
-        log.error(f"[STEP 2] Whisper failed: {e}")
-        raise RuntimeError(f"Transcription failed: {str(e)}")
+    last_error = None
+    for attempt in range(1, 5):  # 4 attempts total
+        try:
+            with open(audio_path, "rb") as f:
+                response = client.audio.transcriptions.create(
+                    file=f,
+                    model="whisper-1",
+                    language="en",
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"],
+                )
+            text = response.text
+            segments = getattr(response, "segments", [])
+            log.info(f"[STEP 2] Transcription complete (attempt {attempt}). {len(text)} chars, {len(segments)} segments.")
+            return {"text": text, "segments": segments}
+        except Exception as e:
+            last_error = e
+            wait = 2 ** attempt  # 2s, 4s, 8s, 16s
+            log.warning(f"[STEP 2] Whisper attempt {attempt}/4 failed: {type(e).__name__}: {e}. Retrying in {wait}s...")
+            if attempt < 4:
+                time.sleep(wait)
+
+    log.error(f"[STEP 2] Whisper failed after 4 attempts: {last_error}")
+    raise RuntimeError(f"Transcription failed: {str(last_error)}")
 
 # ── Step 3: Process with Claude ───────────────────────────────────────────────
 CLAUDE_SYSTEM_PROMPT = """You are the intelligence processor for ZiroWork's Research Brain.
