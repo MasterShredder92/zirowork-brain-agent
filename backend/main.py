@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 from apify_client import ApifyClient
 
 from dotenv import load_dotenv
@@ -453,18 +453,22 @@ def format_markdown(
 
 
 # ── Step 5: save to Google Drive ─────────────────────────────────────────────
-def save_to_drive(content: str, filename: str) -> Optional[str]:
+def save_to_drive(content: str, filename: str) -> Tuple[Optional[str], Optional[str]]:
     log.info(f"[5/6] save to Drive: {filename}")
     if not (GOOGLE_DRIVE_FOLDER_ID and GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON):
         log.warning("[5/6] Drive not configured — skipping")
-        return None
+        return None, "Google Drive is not configured. Set GOOGLE_DRIVE_FOLDER_ID and GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON in Railway Variables."
 
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaInMemoryUpload
+
+    service_account_email = "unknown service account"
 
     try:
         sa_info = json.loads(GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON)
+        service_account_email = sa_info.get("client_email", service_account_email)
         creds = Credentials.from_service_account_info(
             sa_info, scopes=["https://www.googleapis.com/auth/drive.file"]
         )
@@ -486,10 +490,28 @@ def save_to_drive(content: str, filename: str) -> Optional[str]:
         )
         url = file.get("webViewLink") or f"https://drive.google.com/file/d/{file['id']}/view"
         log.info(f"[5/6] saved: {url}")
-        return url
+        return url, None
+    except HttpError as e:
+        status = getattr(e.resp, "status", None)
+        if status == 404:
+            error = (
+                "Google Drive folder was not found by the configured service account. "
+                f"Set Railway GOOGLE_DRIVE_FOLDER_ID to a valid shared folder ID, or share the target folder with {service_account_email}. "
+                f"Current folder ID: {GOOGLE_DRIVE_FOLDER_ID}."
+            )
+        elif status == 403:
+            error = (
+                "Google Drive permission denied. "
+                f"Give Editor access on the target folder to {service_account_email}, then retry."
+            )
+        else:
+            error = f"Google Drive API error {status}: {e}"
+        log.error(f"[5/6] Drive write failed: {error}")
+        return None, error
     except Exception as e:
-        log.error(f"[5/6] Drive write failed: {type(e).__name__}: {e}")
-        return None
+        error = f"Google Drive write failed: {type(e).__name__}: {e}"
+        log.error(f"[5/6] {error}")
+        return None, error
 
 
 # ── API routes ───────────────────────────────────────────────────────────────
@@ -574,11 +596,11 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
         final_md = format_markdown(
             claude_output, creator, category, req.instagram_link, today
         )
-        drive_url = save_to_drive(final_md, filename)
+        drive_url, drive_error = save_to_drive(final_md, filename)
         message = (
             f"Saved to Google Drive: {filename}"
             if drive_url
-            else "Processed successfully, but Google Drive save failed (check logs)."
+            else f"Processed successfully, but Google Drive save failed: {drive_error}"
         )
         preview = final_md[:1500] + ("..." if len(final_md) > 1500 else "")
 
