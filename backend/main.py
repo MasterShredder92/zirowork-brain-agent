@@ -190,9 +190,10 @@ def extract_creator_from_metadata(instagram_link: str) -> str:
 
 
 def auto_categorize_transcript(transcript: str) -> str:
-    """Pick a category from CONTENT_CATEGORIES based on transcript keywords."""
+    """Score categories by keyword frequency. No anthropic, no httpx."""
     log.info(f"[3b/6] auto-categorizing transcript")
     transcript_lower = transcript.lower()
+    scores = {cat: 0 for cat in CONTENT_CATEGORIES}
 
     keyword_map = {
         "Agent Design": ["agent", "agentic", "autonomous", "planning"],
@@ -203,15 +204,13 @@ def auto_categorize_transcript(transcript: str) -> str:
         "Business & Growth": ["business", "growth", "monetization", "acquisition", "metric"],
     }
 
-    scores = {cat: 0 for cat in CONTENT_CATEGORIES}
-    for category, keywords in keyword_map.items():
-        if category in CONTENT_CATEGORIES:
-            for keyword in keywords:
-                scores[category] += transcript_lower.count(keyword)
+    for cat, keywords in keyword_map.items():
+        if cat in CONTENT_CATEGORIES:
+            scores[cat] = sum(transcript_lower.count(kw) for kw in keywords)
 
-    best_category = max(scores, key=scores.get)
-    log.info(f"[3b/6] auto-categorized: {best_category}")
-    return best_category
+    best = max(scores, key=scores.get)
+    log.info(f"[3b/6] auto-categorized: {best}")
+    return best
 
 
 # ── Step 1: extract audio ────────────────────────────────────────────────────
