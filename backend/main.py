@@ -40,13 +40,13 @@ logging.basicConfig(
 log = logging.getLogger("brain-agent")
 
 # ── Config ───────────────────────────────────────────────────────────────────
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
 GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
 INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
-APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN", "")
+APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN", "").strip()
 APIFY_ACTOR_ID = "shu8hvrXbJbY3Eb9W"  # Instagram video downloader actor
 
 APPROVED_CREATORS = [
