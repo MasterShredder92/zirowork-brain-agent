@@ -541,7 +541,6 @@ def save_to_drive(content: str, filename: str) -> Tuple[Optional[str], Optional[
                 ),
                 fields="id, webViewLink",
                 supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
             )
             .execute()
         )
