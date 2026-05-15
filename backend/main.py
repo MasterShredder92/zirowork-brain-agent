@@ -332,7 +332,13 @@ def extract_audio(instagram_link: str, work_dir: str) -> str:
 
 # ── Step 2: transcribe ───────────────────────────────────────────────────────
 def transcribe_audio(audio_path: str) -> str:
-    import openai
+    """
+    Transcribe audio using raw httpx POST to OpenAI Whisper API.
+    Bypasses the OpenAI SDK connection handling that fails on Railway.
+    Retries 4 times with exponential backoff.
+    """
+    import httpx
+    import time
 
     log.info(f"[2/6] transcribe: {audio_path}")
     size = os.path.getsize(audio_path)
@@ -341,22 +347,54 @@ def transcribe_audio(audio_path: str) -> str:
             f"audio is {size / 1024 / 1024:.1f} MB — Whisper rejects >25 MB"
         )
 
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
-    try:
-        with open(audio_path, "rb") as f:
-            resp = client.audio.transcriptions.create(
-                file=f,
-                model="whisper-1",
-                language="en",
-                response_format="verbose_json",
-                timestamp_granularities=["segment"],
-            )
-    except Exception as e:
-        raise RuntimeError(f"Whisper API error: {e}") from e
+    last_error = None
+    for attempt in range(1, 5):  # 4 attempts
+        try:
+            with open(audio_path, "rb") as f:
+                audio_bytes = f.read()
 
-    text = resp.text or ""
-    log.info(f"[2/6] transcript: {len(text)} chars")
-    return text
+            with httpx.Client(timeout=120.0) as client:
+                response = client.post(
+                    "https://api.openai.com/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    files={"file": (os.path.basename(audio_path), audio_bytes, "audio/mpeg")},
+                    data={
+                        "model": "whisper-1",
+                        "language": "en",
+                        "response_format": "verbose_json",
+                        "timestamp_granularities[]": "segment",
+                    },
+                )
+
+            if response.status_code == 200:
+                result = response.json()
+                text = result.get("text", "")
+                log.info(f"[2/6] transcript: {len(text)} chars (attempt {attempt})")
+                return text
+            elif response.status_code == 429:
+                wait = 2 ** attempt
+                log.warning(f"[2/6] Whisper rate limited (attempt {attempt}/4). Retrying in {wait}s...")
+                time.sleep(wait)
+                last_error = RuntimeError(f"Whisper rate limited: {response.text}")
+            else:
+                raise RuntimeError(f"Whisper HTTP {response.status_code}: {response.text}")
+
+        except httpx.ConnectError as e:
+            wait = 2 ** attempt
+            log.warning(f"[2/6] Whisper connection error (attempt {attempt}/4): {e}. Retrying in {wait}s...")
+            last_error = e
+            if attempt < 4:
+                time.sleep(wait)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            wait = 2 ** attempt
+            log.warning(f"[2/6] Whisper error (attempt {attempt}/4): {type(e).__name__}: {e}. Retrying in {wait}s...")
+            last_error = e
+            if attempt < 4:
+                time.sleep(wait)
+
+    raise RuntimeError(f"Whisper API error: {last_error}")
 
 
 # ── Step 3: process with Claude ──────────────────────────────────────────────
