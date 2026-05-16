@@ -25,7 +25,7 @@ Railway service
 | Backend      | Python 3.11 + FastAPI + Uvicorn                     |
 | Audio        | yt-dlp + ffmpeg                                     |
 | Transcribe   | OpenAI Whisper (`whisper-1`)                        |
-| Process      | Anthropic Claude (`claude-3-5-haiku-20241022`)         |
+| Process      | Anthropic Claude (`claude-haiku-4-5-20251001`)         |
 | Storage      | Google Drive API v3 (service account)               |
 | Deploy       | Railway via Nixpacks (single service)               |
 
@@ -180,7 +180,7 @@ date: 2026-05-14
 creator: Andrew Huberman
 category: Agent Design
 source_url: https://instagram.com/reel/...
-processed_by: Claude (claude-3-5-haiku-20241022)
+processed_by: Claude (claude-haiku-4-5-20251001)
 ---
 
 **Source:** [Andrew Huberman](link) | **Date:** 2026-05-14

@@ -71,13 +71,12 @@ CONTENT_CATEGORIES = [
     if c.strip()
 ]
 
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-haiku-20241022").strip()
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001").strip()
 CLAUDE_FALLBACK_MODELS = [
     model
     for model in [
         CLAUDE_MODEL,
-        "claude-3-haiku-20240307",
-        "claude-3-5-haiku-latest",
+        "claude-haiku-4-5",
     ]
     if model
 ]
