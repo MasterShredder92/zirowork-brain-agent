@@ -1,10 +1,10 @@
 # ZiroWork Brain Agent
 
-**Video Intelligence Processor** — converts Instagram links into structured markdown knowledge files for private Drive capture or public email delivery.
+**Video Intelligence Processor** — converts Instagram links into structured markdown knowledge files for private Drive capture or public browser delivery with Kit subscriber capture.
 
 **Private pipeline:** Instagram link → audio extraction → transcript (Whisper) → markdown (Claude) → Zach's Google Drive → cleanup.
 
-**Public share pipeline:** Instagram link + email → audio extraction → transcript (Whisper) → markdown (Claude) → email attachment to submitter → hidden review copy routed to Zach's separate Google Drive folder by importance → cleanup.
+**Public share pipeline:** Instagram link + email → audio extraction → transcript (Whisper) → markdown (Claude) → browser-delivered markdown to submitter → optional Kit subscriber capture → hidden review copy routed to Zach's separate Google Drive folder by importance → cleanup.
 
 ---
 
@@ -29,7 +29,7 @@ Railway service
 | Transcribe   | OpenAI Whisper (`whisper-1`)                        |
 | Process      | Anthropic Claude (`claude-haiku-4-5-20251001`)      |
 | Storage      | Google Drive API v3                                 |
-| Email        | Resend API                                          |
+| Capture      | Kit API v4 subscriber/form/tag sync                 |
 | Deploy       | Railway via Nixpacks (single service)               |
 
 ---
@@ -65,8 +65,9 @@ Railway service
    - `APIFY_API_TOKEN`
    - `GOOGLE_DRIVE_FOLDER_ID`
    - `GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON` or Google OAuth variables
-   - For public share mode: `PUBLIC_REVIEW_FOLDER_ID`, `RESEND_API_KEY`, `PUBLIC_FROM_EMAIL`
-   - Optional public routing: `PUBLIC_HIGH_IMPORTANCE_FOLDER_ID`, `PUBLIC_MEDIUM_IMPORTANCE_FOLDER_ID`, `PUBLIC_LOW_IMPORTANCE_FOLDER_ID`, `PUBLIC_REPLY_TO_EMAIL`
+   - For public share mode: `PUBLIC_REVIEW_FOLDER_ID`
+   - Optional Kit capture: `KIT_API_KEY`, `KIT_FORM_ID`, `KIT_TAG_ID`, `KIT_REFERRER`
+   - Optional public routing: `PUBLIC_HIGH_IMPORTANCE_FOLDER_ID`, `PUBLIC_MEDIUM_IMPORTANCE_FOLDER_ID`, `PUBLIC_LOW_IMPORTANCE_FOLDER_ID`
    - Optional tuning: `APPROVED_CREATORS`, `CONTENT_CATEGORIES`, `CLAUDE_MODEL`, `LOG_LEVEL`
 4. Railway will detect `nixpacks.toml`, install Node + Python + ffmpeg, build the SPA, install Python deps into `/opt/venv`, and start `python backend/main.py`.
 5. The healthcheck at `/api/health` must return 200 within 30s for the deploy to be marked healthy.
@@ -114,7 +115,7 @@ cd backend && python main.py    # FastAPI now serves dist/public + /api on :8000
 
 See [.env.example](.env.example) for the full schema. Required core variables are `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `APIFY_API_TOKEN`. Private mode requires `GOOGLE_DRIVE_FOLDER_ID` plus either service-account JSON or OAuth credentials.
 
-Public share mode requires `PUBLIC_REVIEW_FOLDER_ID` and `RESEND_API_KEY`. The optional high, medium, and low review folder IDs route public copies by importance; if they are blank, every public review copy falls back to `PUBLIC_REVIEW_FOLDER_ID`. Public users receive only the markdown email attachment. Zach's internal review metadata, scoring, and Drive routing stay hidden.
+Public share mode requires `PUBLIC_REVIEW_FOLDER_ID`. Public users receive the markdown directly in the browser with copy/download controls. `KIT_API_KEY` is optional but recommended; when configured, public submitters are captured in Kit and can optionally be routed through `KIT_FORM_ID` and `KIT_TAG_ID`. The optional high, medium, and low review folder IDs route public copies by importance; if they are blank, every public review copy falls back to `PUBLIC_REVIEW_FOLDER_ID`. Zach's internal review metadata, scoring, and Drive routing stay hidden.
 
 `PORT` is set automatically by Railway. `CORS_ALLOW_ORIGINS` defaults to `*` and isn't strictly needed for the single-service setup.
 
@@ -129,7 +130,7 @@ Create this Drive structure under Zach's account, then paste each folder ID into
 | Medium Importance | `PUBLIC_MEDIUM_IMPORTANCE_FOLDER_ID` | No |
 | Low Importance | `PUBLIC_LOW_IMPORTANCE_FOLDER_ID` | No |
 
-Configure Resend with a verified sending domain, then set `RESEND_API_KEY` and `PUBLIC_FROM_EMAIL`. Recommended sender is `ZiroWork <research@zirowork.com>` and recommended reply-to is Zach's support or operator inbox via `PUBLIC_REPLY_TO_EMAIL`.
+Configure Kit if you want public submitters added to your email list. Set `KIT_API_KEY` from Kit's API key screen. Optionally set `KIT_FORM_ID` to attach the subscriber to a Kit form and `KIT_TAG_ID` to tag these leads as Instagram extractor users. Direct transactional email delivery is intentionally not used here; the output is delivered in-browser so there is no Resend dependency.
 
 ---
 
@@ -194,9 +195,10 @@ Configure Resend with a verified sending domain, then set `RESEND_API_KEY` and `
   "mode": "public",
   "filename": "2026-05-14-claude-code-agent-patterns.md",
   "drive_url": null,
-  "email_sent": true,
+  "email_sent": false,
+  "kit_synced": true,
   "preview": "---\ndate: 2026-05-14\n...",
-  "message": "Sent to reader@example.com."
+  "message": "Processed. Your markdown is ready below. You were also added to the ZiroWork Kit list."
 }
 ```
 **Error:**
@@ -207,14 +209,13 @@ Configure Resend with a verified sending domain, then set `RESEND_API_KEY` and `
 | Code | Meaning |
 |---|---|
 | `MISSING_CONFIG` | `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` not set on server |
-| `MISSING_PUBLIC_CONFIG` | Public mode is missing `PUBLIC_REVIEW_FOLDER_ID`, `RESEND_API_KEY`, or is disabled |
+| `MISSING_PUBLIC_CONFIG` | Public mode is disabled or missing `PUBLIC_REVIEW_FOLDER_ID` |
 | `INVALID_MODE` | Request mode is not `private` or `public` |
 | `INVALID_EMAIL` | Public mode request did not include a valid email address |
 | `INVALID_LINK` | Not a recognised Instagram URL |
 | `EXTRACTION_FAILED` | Apify/media download/ffmpeg failed |
 | `TRANSCRIPTION_FAILED` | Whisper API error or audio > 25 MB |
 | `PUBLIC_REVIEW_SAVE_FAILED` | Public output was processed, but Zach's hidden review copy was not saved |
-| `EMAIL_DELIVERY_FAILED` | Hidden review copy was saved, but Resend email delivery failed |
 
 (Claude failures are non-fatal: the raw transcript is saved with a fallback header.)
 

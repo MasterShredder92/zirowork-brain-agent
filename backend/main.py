@@ -18,7 +18,6 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
-import base64
 from apify_client import ApifyClient
 
 from dotenv import load_dotenv
@@ -50,9 +49,10 @@ PUBLIC_REVIEW_FOLDER_ID = os.getenv("PUBLIC_REVIEW_FOLDER_ID", "").strip()
 PUBLIC_HIGH_IMPORTANCE_FOLDER_ID = os.getenv("PUBLIC_HIGH_IMPORTANCE_FOLDER_ID", "").strip()
 PUBLIC_MEDIUM_IMPORTANCE_FOLDER_ID = os.getenv("PUBLIC_MEDIUM_IMPORTANCE_FOLDER_ID", "").strip()
 PUBLIC_LOW_IMPORTANCE_FOLDER_ID = os.getenv("PUBLIC_LOW_IMPORTANCE_FOLDER_ID", "").strip()
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
-PUBLIC_FROM_EMAIL = os.getenv("PUBLIC_FROM_EMAIL", "ZiroWork <research@zirowork.com>").strip()
-PUBLIC_REPLY_TO_EMAIL = os.getenv("PUBLIC_REPLY_TO_EMAIL", "").strip()
+KIT_API_KEY = os.getenv("KIT_API_KEY", "").strip()
+KIT_FORM_ID = os.getenv("KIT_FORM_ID", "").strip()
+KIT_TAG_ID = os.getenv("KIT_TAG_ID", "").strip()
+KIT_REFERRER = os.getenv("KIT_REFERRER", "https://zirowork.com/instagram-link-text-extractor").strip()
 # OAuth credentials (preferred over service account — uses your personal Drive quota)
 # Set GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REFRESH_TOKEN in Railway Variables
 GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
@@ -147,6 +147,7 @@ class ProcessVideoResponse(BaseModel):
     category: Optional[str] = None
     mode: Optional[str] = None
     email_sent: Optional[bool] = None
+    kit_synced: Optional[bool] = None
     importance: Optional[str] = None
 
 
@@ -238,8 +239,6 @@ def _public_config_error() -> Optional[str]:
         return "Public submissions are disabled."
     if not PUBLIC_REVIEW_FOLDER_ID:
         missing.append("PUBLIC_REVIEW_FOLDER_ID")
-    if not RESEND_API_KEY:
-        missing.append("RESEND_API_KEY")
     if missing:
         return "Public share mode is missing Railway variables: " + ", ".join(missing)
     return None
@@ -338,55 +337,64 @@ def _prepend_public_review_metadata(
     )
 
 
-def send_markdown_email(to_email: str, filename: str, markdown: str) -> tuple[bool, Optional[str]]:
-    log.info(f"[5/6] email public output to {to_email}: {filename}")
-    if not RESEND_API_KEY:
-        return False, "RESEND_API_KEY not configured."
+def sync_kit_subscriber(email: str, name: Optional[str], source_url: str) -> tuple[bool, Optional[str]]:
+    """Capture public submitters in Kit when configured.
+
+    Kit is used for subscriber capture and automation. It is not used here as a
+    transactional attachment sender; public users receive markdown directly in
+    the browser, while Zach's review copy is saved privately in Drive.
+    """
+    if not KIT_API_KEY:
+        log.info("[5/6] Kit sync skipped: KIT_API_KEY not configured")
+        return False, None
 
     import httpx
 
-    attachment_content = base64.b64encode(markdown.encode("utf-8")).decode("ascii")
-    payload = {
-        "from": PUBLIC_FROM_EMAIL,
-        "to": [to_email.strip()],
-        "subject": f"Your ZiroWork Instagram breakdown: {filename}",
-        "text": (
-            "Your Instagram breakdown is attached as a Markdown file.\n\n"
-            "You can save it to Notes, Obsidian, Google Drive, or any text editor.\n\n"
-            "— ZiroWork"
-        ),
-        "attachments": [
-            {
-                "filename": filename,
-                "content": attachment_content,
-            }
-        ],
+    headers = {
+        "X-Kit-Api-Key": KIT_API_KEY,
+        "Content-Type": "application/json",
     }
-    if PUBLIC_REPLY_TO_EMAIL:
-        payload["reply_to"] = PUBLIC_REPLY_TO_EMAIL
+    clean_email = email.strip()
+    first_name = (name or "").strip() or None
+    errors: list[str] = []
 
     try:
         with httpx.Client(timeout=30.0) as client:
-            resp = client.post(
-                "https://api.resend.com/emails",
-                headers={
-                    "Authorization": f"Bearer {RESEND_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-        if resp.status_code not in {200, 202}:
-            error = f"Resend HTTP {resp.status_code}: {resp.text[:500]}"
-            log.error(f"[5/6] email failed: {error}")
+            payload: dict[str, object] = {"email_address": clean_email, "state": "active"}
+            if first_name:
+                payload["first_name"] = first_name
+            resp = client.post("https://api.kit.com/v4/subscribers", headers=headers, json=payload)
+            if resp.status_code not in {200, 201}:
+                errors.append(f"create subscriber HTTP {resp.status_code}: {resp.text[:300]}")
+
+            if KIT_FORM_ID:
+                form_resp = client.post(
+                    f"https://api.kit.com/v4/forms/{KIT_FORM_ID}/subscribers",
+                    headers=headers,
+                    json={"email_address": clean_email, "referrer": source_url or KIT_REFERRER},
+                )
+                if form_resp.status_code not in {200, 201}:
+                    errors.append(f"add form HTTP {form_resp.status_code}: {form_resp.text[:300]}")
+
+            if KIT_TAG_ID:
+                tag_resp = client.post(
+                    f"https://api.kit.com/v4/tags/{KIT_TAG_ID}/subscribers",
+                    headers=headers,
+                    json={"email_address": clean_email},
+                )
+                if tag_resp.status_code not in {200, 201}:
+                    errors.append(f"tag subscriber HTTP {tag_resp.status_code}: {tag_resp.text[:300]}")
+
+        if errors:
+            error = "; ".join(errors)
+            log.error(f"[5/6] Kit sync failed: {error}")
             return False, error
-        log.info("[5/6] email sent")
+        log.info("[5/6] Kit subscriber synced")
         return True, None
     except Exception as e:
-        error = f"Email send failed: {type(e).__name__}: {e}"
+        error = f"Kit sync failed: {type(e).__name__}: {e}"
         log.error(f"[5/6] {error}")
         return False, error
-
-
 
 
 def extract_creator_from_url(instagram_link: str) -> str:
@@ -963,7 +971,9 @@ def health() -> dict:
         "claude_max_tokens": CLAUDE_MAX_TOKENS,
         "public_submissions_enabled": PUBLIC_SUBMISSIONS_ENABLED,
         "public_review_folder_configured": bool(PUBLIC_REVIEW_FOLDER_ID),
-        "public_email_configured": bool(RESEND_API_KEY),
+        "kit_configured": bool(KIT_API_KEY),
+        "kit_form_configured": bool(KIT_FORM_ID),
+        "kit_tag_configured": bool(KIT_TAG_ID),
         "openai_configured": bool(OPENAI_API_KEY),
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
     }
@@ -1074,6 +1084,7 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
 
         importance = None
         email_sent = None
+        kit_synced = None
 
         if mode == "public":
             assert req.email is not None
@@ -1098,21 +1109,14 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
                     creator=creator,
                 )
 
-            email_sent, email_error = send_markdown_email(req.email, filename, final_md)
-            if not email_sent:
-                return ProcessVideoResponse(
-                    status="error",
-                    error=f"Internal review copy saved, but email delivery failed: {email_error}",
-                    code="EMAIL_DELIVERY_FAILED",
-                    mode=mode,
-                    filename=filename,
-                    preview=final_md[:1500] + ("..." if len(final_md) > 1500 else ""),
-                    creator=creator,
-                    email_sent=False,
-                )
+            kit_synced, kit_error = sync_kit_subscriber(req.email, req.name, req.instagram_link)
+            if kit_error:
+                log.warning(f"Public submission completed, but Kit sync failed: {kit_error}")
 
-            message = f"Sent to {req.email.strip()}."
-            preview = final_md[:1500] + ("..." if len(final_md) > 1500 else "")
+            message = "Processed. Your markdown is ready below."
+            if kit_synced:
+                message += " You were also added to the ZiroWork Kit list."
+            preview = final_md
             log.info(f"=== done public: {review_filename} ({creator} / {category} / {importance}) ===")
             return ProcessVideoResponse(
                 status="success",
@@ -1122,7 +1126,8 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
                 message=message,
                 creator=creator,
                 mode=mode,
-                email_sent=True,
+                email_sent=False,
+                kit_synced=kit_synced,
             )
 
         drive_url, drive_error = save_to_drive(final_md, filename)
@@ -1144,6 +1149,7 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
             category=category,
             mode=mode,
             email_sent=email_sent,
+            kit_synced=kit_synced,
             importance=importance,
         )
     finally:

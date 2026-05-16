@@ -37,6 +37,7 @@ interface ProcessResult {
   category?: string;
   mode?: Mode;
   email_sent?: boolean;
+  kit_synced?: boolean;
   importance?: "high" | "medium" | "low" | string;
 }
 
@@ -49,7 +50,7 @@ function buildInitialSteps(mode: Mode): PipelineStep[] {
     { id: 5, label: "Process with Claude",  description: "Claude cleans, structures, and expands",        status: "idle" },
     { id: 6, label: "Format Markdown",      description: "YAML front matter + structured sections",       status: "idle" },
     mode === "public"
-      ? { id: 7, label: "Email Output",     description: "Send markdown to submitter and route review copy", status: "idle" }
+      ? { id: 7, label: "Prepare Output",   description: "Show markdown, capture email in Kit, and route review copy", status: "idle" }
       : { id: 7, label: "Save to Drive",    description: "Write to ZiroWork-Brain/Raw Videos/",           status: "idle" },
     { id: 8, label: "Cleanup",              description: "Delete temp audio files",                       status: "idle" },
   ];
@@ -283,14 +284,14 @@ export default function Home() {
               margin: 0,
               maxWidth: 520,
             }}>
-              Paste an Instagram link. Private mode saves clean markdown to Zach's Drive. Share mode emails the markdown to the submitter and silently routes a review copy for ZiroWork research.
+              Paste an Instagram link. Private mode saves clean markdown to Zach's Drive. Share mode gives the submitter their markdown in-browser, captures their email in Kit when configured, and silently routes a review copy for ZiroWork research.
             </p>
           </div>
 
           {/* ── Pipeline overview ── */}
           <div className="zw-callout" style={{ marginBottom: 32, fontSize: 13 }}>
             <span style={{ color: "var(--lime)", fontWeight: 700 }}>PIPELINE:</span>{" "}
-            Link → Creator → Audio → Whisper → Categorize → Claude → {mode === "public" ? "Email + Review Copy" : "Google Drive"}
+            Link → Creator → Audio → Whisper → Categorize → Claude → {mode === "public" ? "Browser Markdown + Kit + Review Copy" : "Google Drive"}
           </div>
 
           {/* ── Form card ── */}
@@ -321,7 +322,7 @@ export default function Home() {
                     <ModeButton
                       active={mode === "public"}
                       title="Share"
-                      subtitle="Public workflow: email the markdown and store a hidden review copy."
+                      subtitle="Public workflow: show markdown, capture email in Kit, and store a hidden review copy."
                       onClick={() => handleModeChange("public")}
                       disabled={isRunning}
                     />
@@ -387,7 +388,7 @@ export default function Home() {
                       PROCESSING...
                     </>
                   ) : mode === "public" ? (
-                    "EMAIL MARKDOWN →"
+                      "GET MARKDOWN →"
                   ) : (
                     "SAVE TO DRIVE →"
                   )}
@@ -478,7 +479,7 @@ export default function Home() {
                         fontSize: 20,
                         letterSpacing: 2,
                         color: "var(--lime)",
-                      }}>{resultMode === "public" ? "SENT TO EMAIL" : "SAVED TO DRIVE"}</span>
+                      }}>{resultMode === "public" ? "MARKDOWN READY" : "SAVED TO DRIVE"}</span>
                       <span style={{ color: "var(--lime)", fontSize: 16 }}>✓</span>
                       {resultMode === "public" && (
                         <span className="zw-badge-purple" style={{ display: "inline-flex" }}>SHARE MODE</span>
@@ -523,7 +524,7 @@ export default function Home() {
                       )}
                       {resultMode === "public" && email && (
                         <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-                          <span className="zw-label" style={{ margin: 0, minWidth: 90 }}>EMAIL</span>
+                          <span className="zw-label" style={{ margin: 0, minWidth: 90 }}>SUBMITTER</span>
                           <span style={{ fontSize: 13, color: "var(--text-color)" }}>{email}</span>
                         </div>
                       )}
@@ -545,8 +546,37 @@ export default function Home() {
                         justifyContent: "space-between",
                         marginBottom: 10,
                       }}>
-                        <span className="zw-label" style={{ margin: 0 }}>MARKDOWN PREVIEW</span>
-                        <span style={{ fontSize: 11, color: "var(--muted2-color)" }}>READ-ONLY</span>
+                        <span className="zw-label" style={{ margin: 0 }}>{resultMode === "public" ? "YOUR MARKDOWN" : "MARKDOWN PREVIEW"}</span>
+                        {resultMode === "public" ? (
+                          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                            <button
+                              type="button"
+                              className="zw-btn-secondary"
+                              style={{ padding: "7px 10px", fontSize: 11 }}
+                              onClick={() => navigator.clipboard?.writeText(result.preview || "")}
+                            >
+                              COPY
+                            </button>
+                            <button
+                              type="button"
+                              className="zw-btn-secondary"
+                              style={{ padding: "7px 10px", fontSize: 11 }}
+                              onClick={() => {
+                                const blob = new Blob([result.preview || ""], { type: "text/markdown;charset=utf-8" });
+                                const url = URL.createObjectURL(blob);
+                                const a = document.createElement("a");
+                                a.href = url;
+                                a.download = result.filename || "zirowork-instagram-breakdown.md";
+                                a.click();
+                                URL.revokeObjectURL(url);
+                              }}
+                            >
+                              DOWNLOAD .MD
+                            </button>
+                          </div>
+                        ) : (
+                          <span style={{ fontSize: 11, color: "var(--muted2-color)" }}>READ-ONLY</span>
+                        )}
                       </div>
                       <div className="zw-markdown-preview">
                         <Streamdown>{result.preview}</Streamdown>
