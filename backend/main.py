@@ -18,6 +18,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
+import base64
 from apify_client import ApifyClient
 
 from dotenv import load_dotenv
@@ -44,6 +45,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "10oKB6NWeo8IbxQ6ZJ--7ckKz1F3Y5et0").strip()
 GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON", "")
+PUBLIC_SUBMISSIONS_ENABLED = os.getenv("PUBLIC_SUBMISSIONS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+PUBLIC_REVIEW_FOLDER_ID = os.getenv("PUBLIC_REVIEW_FOLDER_ID", "").strip()
+PUBLIC_HIGH_IMPORTANCE_FOLDER_ID = os.getenv("PUBLIC_HIGH_IMPORTANCE_FOLDER_ID", "").strip()
+PUBLIC_MEDIUM_IMPORTANCE_FOLDER_ID = os.getenv("PUBLIC_MEDIUM_IMPORTANCE_FOLDER_ID", "").strip()
+PUBLIC_LOW_IMPORTANCE_FOLDER_ID = os.getenv("PUBLIC_LOW_IMPORTANCE_FOLDER_ID", "").strip()
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+PUBLIC_FROM_EMAIL = os.getenv("PUBLIC_FROM_EMAIL", "ZiroWork <research@zirowork.com>").strip()
+PUBLIC_REPLY_TO_EMAIL = os.getenv("PUBLIC_REPLY_TO_EMAIL", "").strip()
 # OAuth credentials (preferred over service account — uses your personal Drive quota)
 # Set GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REFRESH_TOKEN in Railway Variables
 GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
@@ -121,6 +130,9 @@ app.add_middleware(
 # ── Models ───────────────────────────────────────────────────────────────────
 class ProcessVideoRequest(BaseModel):
     instagram_link: str
+    mode: Optional[str] = "private"
+    email: Optional[str] = None
+    name: Optional[str] = None
 
 
 class ProcessVideoResponse(BaseModel):
@@ -133,6 +145,9 @@ class ProcessVideoResponse(BaseModel):
     code: Optional[str] = None
     creator: Optional[str] = None
     category: Optional[str] = None
+    mode: Optional[str] = None
+    email_sent: Optional[bool] = None
+    importance: Optional[str] = None
 
 
 class ConfigResponse(BaseModel):
@@ -200,6 +215,178 @@ def _build_filename_from_claude_output(
         slug = "instagram-video"
 
     return f"{date}-{slug or 'instagram-video'}.md"
+
+
+def _normalize_mode(mode: Optional[str]) -> str:
+    normalized = (mode or "private").strip().lower()
+    if normalized in {"private", "zach", "internal"}:
+        return "private"
+    if normalized in {"public", "share"}:
+        return "public"
+    return "invalid"
+
+
+def _valid_email(email: Optional[str]) -> bool:
+    if not email:
+        return False
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email.strip()))
+
+
+def _public_config_error() -> Optional[str]:
+    missing = []
+    if not PUBLIC_SUBMISSIONS_ENABLED:
+        return "Public submissions are disabled."
+    if not PUBLIC_REVIEW_FOLDER_ID:
+        missing.append("PUBLIC_REVIEW_FOLDER_ID")
+    if not RESEND_API_KEY:
+        missing.append("RESEND_API_KEY")
+    if missing:
+        return "Public share mode is missing Railway variables: " + ", ".join(missing)
+    return None
+
+
+def _score_public_importance(transcript: str, category: str, claude_output: str) -> tuple[str, int, str]:
+    haystack = f"{category}\n{claude_output}\n{transcript}".lower()
+    score = 0
+    reasons = []
+
+    category_scores = {
+        "agent design": 30,
+        "product strategy": 25,
+        "llm optimization": 22,
+        "technical architecture": 20,
+        "business & growth": 18,
+        "ai safety & ethics": 8,
+    }
+    for key, value in category_scores.items():
+        if key in (category or "").lower():
+            score += value
+            reasons.append(f"category:{category}")
+            break
+
+    high_terms = [
+        "claude code", "agent", "automation", "workflow", "prompt", "system",
+        "conversion", "sales", "lead", "mrr", "revenue", "pricing", "landing page",
+        "website", "product", "tool", "template", "framework", "content engine",
+    ]
+    medium_terms = ["ai", "llm", "cursor", "dev", "design", "marketing", "growth", "copy", "seo"]
+
+    high_hits = [term for term in high_terms if term in haystack]
+    medium_hits = [term for term in medium_terms if term in haystack]
+    score += min(len(high_hits) * 8, 48)
+    score += min(len(medium_hits) * 3, 18)
+    if high_hits:
+        reasons.append("high_signal_terms:" + ",".join(high_hits[:6]))
+    if medium_hits:
+        reasons.append("medium_signal_terms:" + ",".join(medium_hits[:6]))
+
+    if len(transcript) >= 1200:
+        score += 8
+        reasons.append("substantive_transcript")
+    elif len(transcript) < 300:
+        score -= 12
+        reasons.append("short_transcript")
+
+    if "processing failed" in claude_output.lower():
+        score -= 18
+        reasons.append("claude_processing_failed")
+
+    if score >= 55:
+        importance = "high"
+    elif score >= 28:
+        importance = "medium"
+    else:
+        importance = "low"
+
+    return importance, max(score, 0), "; ".join(reasons) or "low signal"
+
+
+def _public_review_folder_id(importance: str) -> str:
+    if importance == "high" and PUBLIC_HIGH_IMPORTANCE_FOLDER_ID:
+        return PUBLIC_HIGH_IMPORTANCE_FOLDER_ID
+    if importance == "medium" and PUBLIC_MEDIUM_IMPORTANCE_FOLDER_ID:
+        return PUBLIC_MEDIUM_IMPORTANCE_FOLDER_ID
+    if importance == "low" and PUBLIC_LOW_IMPORTANCE_FOLDER_ID:
+        return PUBLIC_LOW_IMPORTANCE_FOLDER_ID
+    return PUBLIC_REVIEW_FOLDER_ID
+
+
+def _prepend_public_review_metadata(
+    markdown: str,
+    email: str,
+    name: Optional[str],
+    importance: str,
+    score: int,
+    reason: str,
+) -> str:
+    submitter_name = (name or "").strip() or "Not provided"
+    return (
+        "---\n"
+        "submission_mode: public_share\n"
+        f"submitter_email: {email.strip()}\n"
+        f"submitter_name: {submitter_name}\n"
+        f"importance: {importance}\n"
+        f"importance_score: {score}\n"
+        f"importance_reason: {reason}\n"
+        "---\n\n"
+        "# Public Submission Review\n\n"
+        f"**Submitter:** {submitter_name} <{email.strip()}>\n"
+        f"**Importance:** {importance.title()} ({score})\n"
+        f"**Reason:** {reason}\n\n"
+        "---\n\n"
+        + markdown
+    )
+
+
+def send_markdown_email(to_email: str, filename: str, markdown: str) -> tuple[bool, Optional[str]]:
+    log.info(f"[5/6] email public output to {to_email}: {filename}")
+    if not RESEND_API_KEY:
+        return False, "RESEND_API_KEY not configured."
+
+    import httpx
+
+    attachment_content = base64.b64encode(markdown.encode("utf-8")).decode("ascii")
+    payload = {
+        "from": PUBLIC_FROM_EMAIL,
+        "to": [to_email.strip()],
+        "subject": f"Your ZiroWork Instagram breakdown: {filename}",
+        "text": (
+            "Your Instagram breakdown is attached as a Markdown file.\n\n"
+            "You can save it to Notes, Obsidian, Google Drive, or any text editor.\n\n"
+            "— ZiroWork"
+        ),
+        "attachments": [
+            {
+                "filename": filename,
+                "content": attachment_content,
+            }
+        ],
+    }
+    if PUBLIC_REPLY_TO_EMAIL:
+        payload["reply_to"] = PUBLIC_REPLY_TO_EMAIL
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        if resp.status_code not in {200, 202}:
+            error = f"Resend HTTP {resp.status_code}: {resp.text[:500]}"
+            log.error(f"[5/6] email failed: {error}")
+            return False, error
+        log.info("[5/6] email sent")
+        return True, None
+    except Exception as e:
+        error = f"Email send failed: {type(e).__name__}: {e}"
+        log.error(f"[5/6] {error}")
+        return False, error
+
+
 
 
 def extract_creator_from_url(instagram_link: str) -> str:
@@ -700,10 +887,11 @@ def _get_drive_credentials():
     return None
 
 
-def save_to_drive(content: str, filename: str) -> Tuple[Optional[str], Optional[str]]:
-    log.info(f"[5/6] save to Drive: {filename}")
-    if not GOOGLE_DRIVE_FOLDER_ID:
-        return None, "GOOGLE_DRIVE_FOLDER_ID not set in Railway Variables."
+def save_to_drive(content: str, filename: str, folder_id: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    target_folder_id = (folder_id or GOOGLE_DRIVE_FOLDER_ID or "").strip()
+    log.info(f"[5/6] save to Drive: {filename} -> {target_folder_id[:8]}...")
+    if not target_folder_id:
+        return None, "Google Drive folder ID not set in Railway Variables."
 
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
@@ -719,7 +907,7 @@ def save_to_drive(content: str, filename: str) -> Tuple[Optional[str], Optional[
             .create(
                 body={
                     "name": filename,
-                    "parents": [GOOGLE_DRIVE_FOLDER_ID],
+                    "parents": [target_folder_id],
                     "mimeType": "text/markdown",
                 },
                 media_body=MediaInMemoryUpload(
@@ -737,7 +925,7 @@ def save_to_drive(content: str, filename: str) -> Tuple[Optional[str], Optional[
         status = getattr(e.resp, "status", None)
         reason = str(e).lower()
         if status == 404:
-            error = f"Drive folder not found: {GOOGLE_DRIVE_FOLDER_ID}. Check GOOGLE_DRIVE_FOLDER_ID in Railway."
+            error = f"Drive folder not found: {target_folder_id}. Check the configured Drive folder ID in Railway."
         elif status == 403:
             if "storagequotaexceeded" in reason or "quota" in reason:
                 error = "Google Drive storage quota exceeded on the authenticated account."
@@ -773,6 +961,9 @@ def health() -> dict:
         "claude_model": CLAUDE_MODEL,
         "claude_fallback_models": CLAUDE_FALLBACK_MODELS,
         "claude_max_tokens": CLAUDE_MAX_TOKENS,
+        "public_submissions_enabled": PUBLIC_SUBMISSIONS_ENABLED,
+        "public_review_folder_configured": bool(PUBLIC_REVIEW_FOLDER_ID),
+        "public_email_configured": bool(RESEND_API_KEY),
         "openai_configured": bool(OPENAI_API_KEY),
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
     }
@@ -788,19 +979,45 @@ def get_config() -> ConfigResponse:
 
 @app.post("/api/process-video", response_model=ProcessVideoResponse)
 def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
-    log.info(f"=== request: {req.instagram_link[:60]} ===")
+    mode = _normalize_mode(req.mode)
+    log.info(f"=== request: mode={mode} link={req.instagram_link[:60]} ===")
+
+    if mode == "invalid":
+        return ProcessVideoResponse(
+            status="error",
+            error="Invalid mode. Use private or public.",
+            code="INVALID_MODE",
+        )
+    if mode == "public":
+        public_config_error = _public_config_error()
+        if public_config_error:
+            return ProcessVideoResponse(
+                status="error",
+                error=public_config_error,
+                code="MISSING_PUBLIC_CONFIG",
+                mode=mode,
+            )
+        if not _valid_email(req.email):
+            return ProcessVideoResponse(
+                status="error",
+                error="A valid email address is required for public share mode.",
+                code="INVALID_EMAIL",
+                mode=mode,
+            )
 
     if not OPENAI_API_KEY or not ANTHROPIC_API_KEY:
         return ProcessVideoResponse(
             status="error",
             error="Server is missing OPENAI_API_KEY or ANTHROPIC_API_KEY. Set them in Railway Variables.",
             code="MISSING_CONFIG",
+            mode=mode,
         )
     if not _valid_instagram_link(req.instagram_link):
         return ProcessVideoResponse(
             status="error",
             error="Invalid Instagram link. Must be an instagram.com /reel/, /p/, or /tv/ URL.",
             code="INVALID_LINK",
+            mode=mode,
         )
 
     today = datetime.now().strftime("%Y-%m-%d")
@@ -814,7 +1031,7 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
         try:
             audio_path = extract_audio(req.instagram_link, work_dir)
         except RuntimeError as e:
-            return ProcessVideoResponse(status="error", error=str(e), code="EXTRACTION_FAILED")
+            return ProcessVideoResponse(status="error", error=str(e), code="EXTRACTION_FAILED", mode=mode)
 
         try:
             transcript = transcribe_audio(audio_path)
@@ -823,6 +1040,7 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
                 status="error",
                 error=f"Transcription failed: {e}. Check your OpenAI API key and audio file.",
                 code="TRANSCRIPTION_FAILED",
+                mode=mode,
             )
 
         category = auto_categorize_transcript(transcript)
@@ -853,6 +1071,60 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
         final_md = format_markdown(
             claude_output, creator, category, req.instagram_link, today
         )
+
+        importance = None
+        email_sent = None
+
+        if mode == "public":
+            assert req.email is not None
+            importance, score, reason = _score_public_importance(transcript, category, claude_output)
+            review_folder_id = _public_review_folder_id(importance)
+            review_filename = f"{today}-{importance}-{_slugify(req.email.split('@')[0])}-{filename.removeprefix(today + '-') }"
+            review_md = _prepend_public_review_metadata(
+                markdown=final_md,
+                email=req.email,
+                name=req.name,
+                importance=importance,
+                score=score,
+                reason=reason,
+            )
+            internal_drive_url, drive_error = save_to_drive(review_md, review_filename, folder_id=review_folder_id)
+            if not internal_drive_url:
+                return ProcessVideoResponse(
+                    status="error",
+                    error=f"Processed successfully, but internal review copy failed to save: {drive_error}",
+                    code="PUBLIC_REVIEW_SAVE_FAILED",
+                    mode=mode,
+                    creator=creator,
+                )
+
+            email_sent, email_error = send_markdown_email(req.email, filename, final_md)
+            if not email_sent:
+                return ProcessVideoResponse(
+                    status="error",
+                    error=f"Internal review copy saved, but email delivery failed: {email_error}",
+                    code="EMAIL_DELIVERY_FAILED",
+                    mode=mode,
+                    filename=filename,
+                    preview=final_md[:1500] + ("..." if len(final_md) > 1500 else ""),
+                    creator=creator,
+                    email_sent=False,
+                )
+
+            message = f"Sent to {req.email.strip()}."
+            preview = final_md[:1500] + ("..." if len(final_md) > 1500 else "")
+            log.info(f"=== done public: {review_filename} ({creator} / {category} / {importance}) ===")
+            return ProcessVideoResponse(
+                status="success",
+                filename=filename,
+                drive_url=None,
+                preview=preview,
+                message=message,
+                creator=creator,
+                mode=mode,
+                email_sent=True,
+            )
+
         drive_url, drive_error = save_to_drive(final_md, filename)
         message = (
             f"Saved to Google Drive: {filename}"
@@ -861,7 +1133,7 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
         )
         preview = final_md[:1500] + ("..." if len(final_md) > 1500 else "")
 
-        log.info(f"=== done: {filename} ({creator} / {category}) ===")
+        log.info(f"=== done private: {filename} ({creator} / {category}) ===")
         return ProcessVideoResponse(
             status="success",
             filename=filename,
@@ -870,6 +1142,9 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
             message=message,
             creator=creator,
             category=category,
+            mode=mode,
+            email_sent=email_sent,
+            importance=importance,
         )
     finally:
         log.info(f"[6/6] cleanup: {work_dir}")
