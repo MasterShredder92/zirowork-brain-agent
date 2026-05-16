@@ -71,7 +71,18 @@ CONTENT_CATEGORIES = [
     if c.strip()
 ]
 
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-haiku-20241022")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-5-haiku-20241022").strip()
+CLAUDE_FALLBACK_MODELS = [
+    model
+    for model in [
+        CLAUDE_MODEL,
+        "claude-3-haiku-20240307",
+        "claude-3-5-haiku-latest",
+    ]
+    if model
+]
+CLAUDE_FALLBACK_MODELS = list(dict.fromkeys(CLAUDE_FALLBACK_MODELS))
+CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "2500"))
 WHISPER_MAX_BYTES = 25 * 1024 * 1024  # OpenAI hard limit
 YTDLP_TIMEOUT_SEC = 180
 
@@ -583,44 +594,66 @@ OUTPUT MARKDOWN ONLY. NO PREAMBLE. JUST THE MARKDOWN."""
 def process_with_claude(transcript: str, creator: str, category: str, source_url: str) -> str:
     """
     Process transcript with Claude using raw httpx POST.
-    Bypasses the Anthropic SDK connection handling that may fail on Railway.
+
+    Haiku occasionally fails by model/version availability or output budget. Keep the
+    primary model configurable, then fall through known Haiku IDs before returning a
+    raw-transcript fallback.
     """
     import httpx
 
-    log.info(f"[3/6] Claude ({CLAUDE_MODEL})")
     user = (
         f"Creator: {creator}\n"
         f"Category: {category}\n"
         f"Source: {source_url}\n\n"
         f"TRANSCRIPT:\n{transcript}"
     )
-    payload = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": 4000,
-        "system": CLAUDE_SYSTEM_PROMPT,
-        "messages": [{"role": "user", "content": user}],
-    }
-    try:
-        with httpx.Client(timeout=120.0) as client:
-            resp = client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json=payload,
-            )
-        if resp.status_code != 200:
-            raise RuntimeError(f"Claude HTTP {resp.status_code}: {resp.text[:500]}")
-        data = resp.json()
-        out = data["content"][0]["text"]
-        log.info(f"[3/6] Claude output: {len(out)} chars")
-        return out
-    except RuntimeError:
-        raise
-    except Exception as e:
-        raise RuntimeError(f"Claude API error: {type(e).__name__}: {e}") from e
+    last_error = None
+
+    for model in CLAUDE_FALLBACK_MODELS:
+        log.info(f"[3/6] Claude ({model})")
+        payload = {
+            "model": model,
+            "max_tokens": CLAUDE_MAX_TOKENS,
+            "system": CLAUDE_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user}],
+        }
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                resp = client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json=payload,
+                )
+            if resp.status_code != 200:
+                last_error = f"Claude HTTP {resp.status_code}: {resp.text[:500]}"
+                log.warning(f"[3/6] Claude model failed ({model}): {last_error}")
+                continue
+
+            data = resp.json()
+            content_blocks = data.get("content", [])
+            text_blocks = [
+                block.get("text", "")
+                for block in content_blocks
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            out = "\n".join(block for block in text_blocks if block).strip()
+            if not out:
+                last_error = f"Claude returned no text content: {str(data)[:500]}"
+                log.warning(f"[3/6] Claude model failed ({model}): {last_error}")
+                continue
+
+            log.info(f"[3/6] Claude output from {model}: {len(out)} chars")
+            return out
+        except Exception as e:
+            last_error = f"Claude API error on {model}: {type(e).__name__}: {e}"
+            log.warning(f"[3/6] {last_error}")
+            continue
+
+    raise RuntimeError(last_error or "Claude API failed for all configured Haiku models")
 
 
 # ── Step 4: format markdown ──────────────────────────────────────────────────
@@ -739,6 +772,8 @@ def health() -> dict:
         "drive_auth_method": "oauth" if GOOGLE_OAUTH_REFRESH_TOKEN else ("service_account" if GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON else "none"),
         "drive_folder_id": GOOGLE_DRIVE_FOLDER_ID[:8] + "..." if GOOGLE_DRIVE_FOLDER_ID else "not set",
         "claude_model": CLAUDE_MODEL,
+        "claude_fallback_models": CLAUDE_FALLBACK_MODELS,
+        "claude_max_tokens": CLAUDE_MAX_TOKENS,
         "openai_configured": bool(OPENAI_API_KEY),
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
     }
@@ -802,9 +837,11 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
             )
         except RuntimeError as e:
             log.warning(f"Claude failed, falling back to raw transcript: {e}")
+            safe_error = str(e).replace("\n", " ")[:700]
             claude_output = (
                 "# Processing Failed\n\n"
-                "**Note:** Claude processing failed. Raw transcript below.\n\n---\n\n"
+                "**Note:** Claude processing failed. Raw transcript below.\n\n"
+                f"**Claude error:** `{safe_error}`\n\n---\n\n"
                 + transcript
             )
 
