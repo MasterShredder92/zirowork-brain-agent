@@ -264,9 +264,11 @@ def auto_categorize_transcript(transcript: str) -> str:
 # ── Step 1: extract audio ────────────────────────────────────────────────────
 def extract_audio(instagram_link: str, work_dir: str) -> str:
     """
-    Download audio from Instagram via Apify (no rate limiting).
-    Uses Apify's Instagram actor to fetch the video, then ffmpeg to extract audio.
-    Returns path to audio file.
+    Download audio from Instagram via Apify.
+
+    The Apify payload can contain multiple signed Instagram/Facebook CDN URLs. Those URLs
+    can be short-lived or intermittently blocked by the CDN, so we try every plausible
+    video URL with browser-like headers before failing the extraction step.
     """
     log.info(f"[1/6] extract audio via Apify: {instagram_link}")
 
@@ -277,7 +279,52 @@ def extract_audio(instagram_link: str, work_dir: str) -> str:
             "Set it to your Apify API token from https://apify.com/account/integrations"
         )
 
-    # Step 1: Run Apify Instagram actor to download the video
+    def _flatten_urls(value) -> list[str]:
+        urls: list[str] = []
+        if isinstance(value, str):
+            clean = value.strip().replace("&amp;", "&").replace("\\u0026", "&")
+            if clean.lower().startswith(("http://", "https://")):
+                urls.append(re.sub(r"^https?://", lambda m: m.group(0).lower(), clean, flags=re.I))
+        elif isinstance(value, list):
+            for item in value:
+                urls.extend(_flatten_urls(item))
+        elif isinstance(value, dict):
+            for item in value.values():
+                urls.extend(_flatten_urls(item))
+        return urls
+
+    def _candidate_media_urls(post: dict) -> list[str]:
+        priority_keys = [
+            "videoUrl",
+            "videoUrls",
+            "video_url",
+            "video",
+            "videos",
+            "mediaUrl",
+            "media_url",
+            "displayUrl",
+            "display_url",
+        ]
+        candidates: list[str] = []
+        for key in priority_keys:
+            candidates.extend(_flatten_urls(post.get(key)))
+
+        # Fallback: actors change schemas. Pull any nested URL under video/media keys.
+        for key, value in post.items():
+            key_lower = str(key).lower()
+            if "video" in key_lower or "media" in key_lower:
+                candidates.extend(_flatten_urls(value))
+
+        seen = set()
+        deduped: list[str] = []
+        for url in candidates:
+            if url in seen:
+                continue
+            seen.add(url)
+            deduped.append(url)
+        return deduped
+
+    # Step 1: Run Apify Instagram actor to get media URLs.
     log.info("[1/6] running Apify Instagram actor...")
     client = ApifyClient(APIFY_API_TOKEN)
 
@@ -291,7 +338,6 @@ def extract_audio(instagram_link: str, work_dir: str) -> str:
         run = client.actor(APIFY_ACTOR_ID).call(run_input=run_input)
         log.info(f"[1/6] Apify actor finished: {run['status']}")
 
-        # Fetch results from the dataset
         results = list(client.dataset(run["defaultDatasetId"]).iterate_items())
 
         if not results:
@@ -300,82 +346,121 @@ def extract_audio(instagram_link: str, work_dir: str) -> str:
 
         post = results[0]
         log.info(f"[1/6] Apify found post by {post.get('ownerUsername', 'Unknown')}")
-
-        # Extract video URL from the result
-        # Apify returns multiple video URLs; use the first one
-        video_urls = post.get("videoUrl") or post.get("displayUrl")
+        video_urls = _candidate_media_urls(post)
 
         if not video_urls:
             log.error(f"[1/6] No video URL in Apify response: {post.keys()}")
             raise RuntimeError("Apify found the post but no video URL. May be a carousel or unsupported format.")
 
-        # Handle both single string and list of URLs
-        if isinstance(video_urls, list):
-            video_url = video_urls[0]
-        else:
-            video_url = video_urls
-
-        log.info(f"[1/6] extracted video URL: {video_url[:80]}...")
+        log.info(f"[1/6] Apify returned {len(video_urls)} candidate media URL(s)")
 
     except Exception as e:
         log.error(f"[1/6] Apify actor failed: {type(e).__name__}: {e}")
         raise RuntimeError(f"Apify Instagram actor failed: {str(e)[:250]}") from e
 
-    # Step 2: Download the video file
+    # Step 2 + 3: Download each candidate and extract audio until one works.
     log.info("[1/6] downloading video file...")
     import requests
-    try:
-        video_response = requests.get(video_url, timeout=120, stream=True)
-        video_response.raise_for_status()
-    except Exception as e:
-        log.error(f"[1/6] video download failed: {e}")
-        raise RuntimeError(f"Failed to download video from URL: {str(e)[:200]}") from e
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    session = requests.Session()
+    retry = Retry(
+        total=2,
+        connect=2,
+        read=2,
+        backoff_factor=0.6,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.mount("http://", HTTPAdapter(max_retries=retry))
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+        "Referer": "https://www.instagram.com/",
+    }
 
     video_path = os.path.join(work_dir, "video.mp4")
-    try:
-        with open(video_path, "wb") as f:
-            for chunk in video_response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-        video_size = os.path.getsize(video_path)
-        log.info(f"[1/6] video downloaded: {video_size / 1024 / 1024:.1f} MB")
-    except Exception as e:
-        log.error(f"[1/6] failed to write video file: {e}")
-        raise RuntimeError(f"Failed to save video file: {str(e)[:200]}") from e
-
-    # Step 3: Extract audio from video using ffmpeg
-    log.info("[1/6] extracting audio from video with ffmpeg...")
     audio_path = os.path.join(work_dir, "audio.mp3")
-    cmd = [
-        "ffmpeg",
-        "-i", video_path,
-        "-q:a", "5",
-        "-n",  # Don't overwrite if exists
-        audio_path,
-    ]
+    last_error = None
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"ffmpeg timed out after 120s") from e
-    except FileNotFoundError as e:
-        raise RuntimeError("ffmpeg not installed in this environment") from e
+    for index, video_url in enumerate(video_urls, start=1):
+        for output_path in (video_path, audio_path):
+            if os.path.exists(output_path):
+                os.remove(output_path)
 
-    if result.returncode != 0 and not os.path.exists(audio_path):
-        log.error(f"[1/6] ffmpeg stderr: {result.stderr[:500]}")
-        raise RuntimeError(f"ffmpeg failed: {result.stderr.strip()[:300]}")
+        try:
+            log.info(f"[1/6] downloading candidate {index}/{len(video_urls)}: {video_url[:80]}...")
+            with session.get(
+                video_url,
+                timeout=(15, 180),
+                stream=True,
+                allow_redirects=True,
+                headers=headers,
+            ) as video_response:
+                video_response.raise_for_status()
+                content_type = video_response.headers.get("content-type", "").lower()
+                if content_type.startswith("image/"):
+                    raise RuntimeError(f"candidate is image content ({content_type}), not video")
 
-    if not os.path.exists(audio_path):
-        raise RuntimeError("ffmpeg ran but produced no audio file")
+                with open(video_path, "wb") as f:
+                    for chunk in video_response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
 
-    audio_size = os.path.getsize(audio_path)
-    log.info(f"[1/6] audio extracted: {audio_size / 1024:.1f} KB")
-    return audio_path
+            video_size = os.path.getsize(video_path)
+            if video_size < 10 * 1024:
+                raise RuntimeError(f"downloaded media was too small ({video_size} bytes)")
+            log.info(f"[1/6] video downloaded: {video_size / 1024 / 1024:.1f} MB")
+
+            log.info("[1/6] extracting audio from video with ffmpeg...")
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i", video_path,
+                "-q:a", "5",
+                audio_path,
+            ]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+
+            if result.returncode != 0 or not os.path.exists(audio_path):
+                raise RuntimeError(f"ffmpeg failed: {result.stderr.strip()[:300]}")
+
+            audio_size = os.path.getsize(audio_path)
+            if audio_size <= 0:
+                raise RuntimeError("ffmpeg produced an empty audio file")
+
+            log.info(f"[1/6] audio extracted: {audio_size / 1024:.1f} KB")
+            return audio_path
+
+        except subprocess.TimeoutExpired as e:
+            last_error = "ffmpeg timed out after 120s"
+            log.warning(f"[1/6] candidate {index} failed: {last_error}")
+            if index == len(video_urls):
+                raise RuntimeError(last_error) from e
+        except FileNotFoundError as e:
+            raise RuntimeError("ffmpeg not installed in this environment") from e
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {str(e)[:220]}"
+            log.warning(f"[1/6] candidate {index} failed: {last_error}")
+            continue
+
+    raise RuntimeError(
+        "Failed to download/extract video from Apify media URLs. "
+        f"Tried {len(video_urls)} candidate(s). Last error: {last_error}"
+    )
 
 
 # ── Step 2: transcribe ───────────────────────────────────────────────────────
