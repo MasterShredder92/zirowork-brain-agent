@@ -158,8 +158,8 @@ class ConfigResponse(BaseModel):
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 _INSTAGRAM_PATTERNS = [
-    re.compile(r"^https?://(www\.)?instagram\.com/(p|reel|tv)/[\w-]+"),
-    re.compile(r"^https?://(www\.)?instagram\.com/[\w.]+/(p|reel|tv)/[\w-]+"),
+    re.compile(r"^https?://(www\.)?instagram\.com/(p|reel|reels|tv)/[\w-]+"),
+    re.compile(r"^https?://(www\.)?instagram\.com/[\w.]+/(p|reel|reels|tv)/[\w-]+"),
 ]
 
 
@@ -404,7 +404,7 @@ def extract_creator_from_url(instagram_link: str) -> str:
         from urllib.parse import urlparse
         parsed = urlparse(instagram_link)
         path_parts = parsed.path.strip("/").split("/")
-        if path_parts and path_parts[0] and not path_parts[0] in ("reel", "p", "tv", "stories"):
+        if path_parts and path_parts[0] and not path_parts[0] in ("reel", "reels", "p", "tv", "stories"):
             creator = path_parts[0].replace(".", " ").title()
             log.info(f"[0/6] extracted creator from URL: {creator}")
             return creator
@@ -1025,7 +1025,7 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
     if not _valid_instagram_link(req.instagram_link):
         return ProcessVideoResponse(
             status="error",
-            error="Invalid Instagram link. Must be an instagram.com /reel/, /p/, or /tv/ URL.",
+            error="Invalid Instagram link. Must be an instagram.com /reel/, /reels/, /p/, or /tv/ URL.",
             code="INVALID_LINK",
             mode=mode,
         )
