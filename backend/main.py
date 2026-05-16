@@ -145,8 +145,51 @@ def _slugify(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
-def _build_filename(creator: str, date: str) -> str:
-    return f"{date}-{_slugify(creator)}.md"
+def _extract_title_from_markdown(markdown: str) -> Optional[str]:
+    """Extract the first real H1 title from Claude's markdown output."""
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("# "):
+            continue
+
+        title = stripped.lstrip("#").strip()
+        title = re.sub(r"[*_`\[\]]+", "", title).strip()
+        if not title:
+            continue
+        if title.lower() in {"processing failed", "untitled", "unknown"}:
+            continue
+        return title
+
+    return None
+
+
+def _is_unknown_creator(creator: Optional[str]) -> bool:
+    return _slugify(creator or "") in {"", "unknown", "unknown-creator"}
+
+
+def _build_filename_from_claude_output(
+    claude_output: str,
+    creator: Optional[str],
+    category: Optional[str],
+    date: str,
+) -> str:
+    """
+    Build Drive filename from Claude's video-topic title instead of creator.
+
+    Primary: first H1 from Claude output, which should describe what the video is about.
+    Fallbacks avoid producing generic `unknown-creator` filenames when metadata fails.
+    """
+    topic = _extract_title_from_markdown(claude_output)
+    if topic:
+        slug = _slugify(topic)
+    elif category:
+        slug = _slugify(category)
+    elif creator and not _is_unknown_creator(creator):
+        slug = _slugify(creator)
+    else:
+        slug = "instagram-video"
+
+    return f"{date}-{slug or 'instagram-video'}.md"
 
 
 def extract_creator_from_url(instagram_link: str) -> str:
@@ -648,7 +691,6 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
 
     try:
         creator = extract_creator_from_metadata(req.instagram_link)
-        filename = _build_filename(creator, today)
 
         try:
             audio_path = extract_audio(req.instagram_link, work_dir)
@@ -681,6 +723,12 @@ def process_video(req: ProcessVideoRequest) -> ProcessVideoResponse:
                 + transcript
             )
 
+        filename = _build_filename_from_claude_output(
+            claude_output=claude_output,
+            creator=creator,
+            category=category,
+            date=today,
+        )
         final_md = format_markdown(
             claude_output, creator, category, req.instagram_link, today
         )
